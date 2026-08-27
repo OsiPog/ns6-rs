@@ -67,7 +67,16 @@ impl Ns6 {
         let handle = rusb::open_device_with_vid_pid(p::VID, p::PID).ok_or(Error::NotFound)?;
         handle.set_auto_detach_kernel_driver(true).ok();
 
-        for iface in p::INTERFACES {
+        // NS6_IFACES lets a single binary try different claim sets while
+        // hunting for whatever the device is waiting on.
+        let ifaces: Vec<u8> = match std::env::var("NS6_IFACES") {
+            Ok(v) => v
+                .split(',')
+                .filter_map(|x| x.trim().parse::<u8>().ok())
+                .collect(),
+            Err(_) => p::INTERFACES.to_vec(),
+        };
+        for iface in ifaces {
             handle.claim_interface(iface)?;
             // Force an alt 0 -> alt 1 transition. Alt 0 is the zero-bandwidth
             // idle setting; going straight to alt 1 when the device is already

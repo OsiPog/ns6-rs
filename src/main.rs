@@ -217,7 +217,12 @@ fn cmd_probe() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("status   : 0x{:02X}", dev.status()?);
     println!("sample rate:");
-    dev.set_sample_rate_verbose(p::SAMPLE_RATE);
+    dev.set_sample_rate_verbose(
+        std::env::var("NS6_RATE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(p::SAMPLE_RATE),
+    );
     let (before, after) = dev.arm()?;
     println!("armed    : 0x{before:02X} -> 0x{after:02X}");
     dev.clear_halts();
@@ -233,15 +238,19 @@ fn cmd_probe() -> Result<(), Box<dyn std::error::Error>> {
             Some((p::OUT_FRAME_BYTES, p::SAMPLE_RATE as u64)),
         )
     };
-    let iso_in = unsafe {
-        iso::IsoStream::start(
-            dev.raw_handle(),
-            p::EP_ISO_IN,
-            p::ISO_IN_PACKET,
-            p::ISO_PACKETS_PER_XFER,
-            4,
-            None,
-        )
+    let iso_in = if std::env::var("NS6_NO_ISO_IN").is_ok() {
+        Err(0)
+    } else {
+        unsafe {
+            iso::IsoStream::start(
+                dev.raw_handle(),
+                p::EP_ISO_IN,
+                p::ISO_IN_PACKET,
+                p::ISO_PACKETS_PER_XFER,
+                4,
+                None,
+            )
+        }
     };
     match (&iso_out, &iso_in) {
         (Ok(_), Ok(_)) => println!("iso      : streams up on 0x02 and 0x81"),
@@ -283,6 +292,14 @@ fn cmd_probe() -> Result<(), Box<dyn std::error::Error>> {
             _midi_in.as_ref().err(),
             _audio_in.as_ref().err()
         ),
+    }
+
+    if std::env::var("NS6_ARM_AFTER").is_ok() {
+        thread::sleep(Duration::from_millis(200));
+        match dev.arm() {
+            Ok((b, a)) => println!("re-armed after streaming: 0x{b:02X} -> 0x{a:02X}"),
+            Err(e) => println!("re-arm failed: {e}"),
+        }
     }
 
     println!("\nwatching for device activity for 20s (move controls now)\n");
