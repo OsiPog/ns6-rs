@@ -32,7 +32,51 @@ pub static ISO_IN_DATA: AtomicU64 = AtomicU64::new(0);
 /// Set true to hex-dump non-zero isochronous IN payloads, for protocol work.
 pub static ISO_IN_DUMP: AtomicBool = AtomicBool::new(false);
 
+/// Bresenham accumulator for the isochronous frame pattern, in sample-rate units.
+static FRAME_ACC: AtomicU64 = AtomicU64::new(0);
+
+/// Microframes per second at USB high speed.
+const MICROFRAMES_PER_SEC: u64 = 8000;
+
+/// Frames to place in the next isochronous OUT packet.
+///
+/// `requestIsocOut()` takes the count from a pattern table built by
+/// `InitFramePattern`; at 44.1 kHz that averages 44100/8000 = 5.5125 frames per
+/// microframe, so packets alternate between 5 and 6 frames. This reproduces the
+/// same average with a Bresenham accumulator rather than a precomputed table.
+fn next_frame_count(rate: u64) -> u64 {
+    let acc = FRAME_ACC.fetch_add(rate, Ordering::Relaxed) + rate;
+    let frames = acc / MICROFRAMES_PER_SEC;
+    FRAME_ACC.fetch_sub(frames * MICROFRAMES_PER_SEC, Ordering::Relaxed);
+    frames
+}
+
+/// Size every packet of an isochronous OUT transfer from the frame pattern.
+///
+/// Sending the endpoint's full max packet size every microframe would be far
+/// more audio than the sample rate calls for, and the device simply ignores the
+/// stream.
+unsafe fn size_out_packets(t: &mut ffi::libusb_transfer, bytes_per_frame: usize, rate: u64) {
+    let descs =
+        std::slice::from_raw_parts_mut(t.iso_packet_desc.as_mut_ptr(), t.num_iso_packets as usize);
+    let mut total = 0usize;
+    for d in descs.iter_mut() {
+        let len = next_frame_count(rate) as usize * bytes_per_frame;
+        d.length = len as c_uint;
+        d.actual_length = 0;
+        d.status = 0;
+        total += len;
+    }
+    t.length = total as c_int;
+}
+
+/// Bytes per audio frame on the isochronous OUT endpoint, and the sample rate.
+/// Set once at startup so the completion callback can resize packets.
+static OUT_BYTES_PER_FRAME: AtomicU64 = AtomicU64::new(0);
+static OUT_RATE: AtomicU64 = AtomicU64::new(0);
+
 const LIBUSB_TRANSFER_TYPE_ISOCHRONOUS: u8 = 1;
+const LIBUSB_TRANSFER_TYPE_BULK: u8 = 2;
 const LIBUSB_TRANSFER_COMPLETED: c_int = 0;
 const LIBUSB_TRANSFER_CANCELLED: c_int = 3;
 
@@ -77,6 +121,13 @@ extern "system" fn on_complete(xfer: *mut ffi::libusb_transfer) {
         }
 
         if ISO_RUNNING.load(Ordering::Relaxed) {
+            if !is_input {
+                let bpf = OUT_BYTES_PER_FRAME.load(Ordering::Relaxed) as usize;
+                let rate = OUT_RATE.load(Ordering::Relaxed);
+                if bpf > 0 && rate > 0 {
+                    size_out_packets(&mut *xfer, bpf, rate);
+                }
+            }
             ffi::libusb_submit_transfer(xfer);
         }
     }
@@ -110,7 +161,12 @@ impl IsoStream {
         packet_size: usize,
         packets_per_transfer: usize,
         transfer_count: usize,
+        frame_pattern: Option<(usize, u64)>,
     ) -> Result<Self, i32> {
+        if let Some((bytes_per_frame, rate)) = frame_pattern {
+            OUT_BYTES_PER_FRAME.store(bytes_per_frame as u64, Ordering::Relaxed);
+            OUT_RATE.store(rate, Ordering::Relaxed);
+        }
         let mut transfers = Vec::with_capacity(transfer_count);
 
         for _ in 0..transfer_count {
@@ -147,6 +203,11 @@ impl IsoStream {
                     d.length = packet_size as c_uint;
                     d.actual_length = 0;
                     d.status = 0;
+                }
+
+                // OUT packets carry only as much audio as the sample rate calls for.
+                if let Some((bytes_per_frame, rate)) = frame_pattern {
+                    size_out_packets(t, bytes_per_frame, rate);
                 }
             }
 
@@ -212,5 +273,128 @@ pub fn pump_events() {
             &tv as *const _ as *const _,
             std::ptr::null_mut(),
         );
+    }
+}
+
+/* ------------------------------------------------------------------ bulk */
+
+use std::sync::Mutex;
+
+/// Raw MIDI bytes received from the controller, drained by the main loop.
+pub static MIDI_IN: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+pub static MIDI_IN_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static BULK_IN_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static BULK_IN_OK: AtomicU64 = AtomicU64::new(0);
+
+/// Endpoint whose payloads should be treated as MIDI (filler stripped).
+static MIDI_IN_EP: AtomicU64 = AtomicU64::new(0);
+
+extern "system" fn on_bulk_in(xfer: *mut ffi::libusb_transfer) {
+    unsafe {
+        let t = &*xfer;
+        if t.status == LIBUSB_TRANSFER_CANCELLED {
+            return;
+        }
+        if t.status == LIBUSB_TRANSFER_COMPLETED && t.actual_length > 0 {
+            BULK_IN_OK.fetch_add(1, Ordering::Relaxed);
+            BULK_IN_BYTES.fetch_add(t.actual_length as u64, Ordering::Relaxed);
+
+            if t.endpoint as u64 == MIDI_IN_EP.load(Ordering::Relaxed) {
+                let data = std::slice::from_raw_parts(t.buffer, t.actual_length as usize);
+                let mut clean = Vec::with_capacity(data.len());
+                crate::protocol::strip_midi_filler(data, &mut clean);
+                if !clean.is_empty() {
+                    MIDI_IN_BYTES.fetch_add(clean.len() as u64, Ordering::Relaxed);
+                    if let Ok(mut q) = MIDI_IN.lock() {
+                        q.extend_from_slice(&clean);
+                    }
+                }
+            }
+        }
+        if ISO_RUNNING.load(Ordering::Relaxed) {
+            ffi::libusb_submit_transfer(xfer);
+        }
+    }
+}
+
+/// A queue of asynchronous bulk IN transfers, mirroring the vendor driver's
+/// 8-deep URB queues. A single blocking read leaves gaps where nothing is
+/// posted, which a device expecting continuous I/O can stall on.
+pub struct BulkInStream {
+    transfers: Vec<IsoTransfer>,
+}
+
+impl BulkInStream {
+    /// # Safety
+    /// `handle` must be a live libusb handle with the owning interface claimed,
+    /// and must outlive the stream.
+    pub unsafe fn start(
+        handle: *mut ffi::libusb_device_handle,
+        endpoint: u8,
+        buf_size: usize,
+        count: usize,
+        is_midi: bool,
+    ) -> Result<Self, i32> {
+        if is_midi {
+            MIDI_IN_EP.store(endpoint as u64, Ordering::Relaxed);
+        }
+        let mut transfers = Vec::with_capacity(count);
+
+        for _ in 0..count {
+            let mut buffer = vec![0u8; buf_size].into_boxed_slice();
+            let ptr = ffi::libusb_alloc_transfer(0);
+            if ptr.is_null() {
+                return Err(-1);
+            }
+            {
+                let t = &mut *ptr;
+                t.dev_handle = handle;
+                t.endpoint = endpoint;
+                t.transfer_type = LIBUSB_TRANSFER_TYPE_BULK;
+                t.timeout = 0; // no timeout: stay posted until data arrives
+                t.buffer = buffer.as_mut_ptr();
+                t.length = buf_size as c_int;
+                t.num_iso_packets = 0;
+                t.callback = on_bulk_in;
+                t.user_data = std::ptr::null_mut::<c_void>();
+                t.flags = 0;
+                t.status = 0;
+                t.actual_length = 0;
+            }
+            let rc = ffi::libusb_submit_transfer(ptr);
+            if rc != 0 {
+                ffi::libusb_free_transfer(ptr);
+                return Err(rc);
+            }
+            transfers.push(IsoTransfer {
+                ptr,
+                _buffer: buffer,
+            });
+        }
+        Ok(Self { transfers })
+    }
+}
+
+impl Drop for BulkInStream {
+    fn drop(&mut self) {
+        unsafe {
+            for t in &self.transfers {
+                ffi::libusb_cancel_transfer(t.ptr);
+            }
+            for _ in 0..20 {
+                let tv = libc_timeval {
+                    tv_sec: 0,
+                    tv_usec: 20_000,
+                };
+                ffi::libusb_handle_events_timeout_completed(
+                    std::ptr::null_mut(),
+                    &tv as *const _ as *const _,
+                    std::ptr::null_mut(),
+                );
+            }
+            for t in &self.transfers {
+                ffi::libusb_free_transfer(t.ptr);
+            }
+        }
     }
 }

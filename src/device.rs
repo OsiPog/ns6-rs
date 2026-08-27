@@ -49,8 +49,6 @@ impl From<rusb::Error> for Error {
 pub struct Stats {
     pub out_ok: AtomicU64,
     pub out_err: AtomicU64,
-    pub pcm_in: AtomicU64,
-    pub midi_in_bytes: AtomicU64,
     pub midi_out_bytes: AtomicU64,
 }
 
@@ -71,6 +69,10 @@ impl Ns6 {
 
         for iface in p::INTERFACES {
             handle.claim_interface(iface)?;
+            // Force an alt 0 -> alt 1 transition. Alt 0 is the zero-bandwidth
+            // idle setting; going straight to alt 1 when the device is already
+            // there is a no-op and never restarts its streaming engine.
+            let _ = handle.set_alternate_setting(iface, 0);
             handle.set_alternate_setting(iface, p::ALT_SETTING)?;
         }
 
@@ -108,7 +110,9 @@ impl Ns6 {
     /// Set the sample rate on both PCM endpoints (audio class `SET_CUR`).
     pub fn set_sample_rate(&self, rate: u32) -> Result<(), Error> {
         let bytes = p::encode_rate(rate);
-        for ep in [p::EP_PCM_IN, p::EP_PCM_OUT] {
+        // The audio endpoints: isochronous out/in plus the bulk audio in.
+        // 0x04 is MIDI, so it gets no sample rate.
+        for ep in [p::EP_ISO_OUT, p::EP_ISO_IN, p::EP_PCM_IN] {
             self.handle.write_control(
                 p::SET_CUR_TYPE,
                 p::SET_CUR_REQ,
@@ -119,6 +123,51 @@ impl Ns6 {
             )?;
         }
         Ok(())
+    }
+
+    /// Read back the sample rate the device reports for an endpoint (`GET_CUR`).
+    ///
+    /// The vendor driver does this after setting the rate; a rate that does not
+    /// stick is a good early indicator that the endpoint is not configured the
+    /// way the device expects.
+    pub fn get_sample_rate(&self, ep: u8) -> Result<u32, Error> {
+        let mut buf = [0u8; 3];
+        self.handle.read_control(
+            0xA2, // class, IN, recipient = endpoint
+            0x81, // GET_CUR
+            p::SET_CUR_VALUE,
+            ep as u16,
+            &mut buf,
+            CTRL_TIMEOUT,
+        )?;
+        Ok(u32::from(buf[0]) | u32::from(buf[1]) << 8 | u32::from(buf[2]) << 16)
+    }
+
+    /// Set the sample rate, reporting the result per endpoint.
+    pub fn set_sample_rate_verbose(&self, rate: u32) {
+        for ep in [p::EP_ISO_OUT, p::EP_ISO_IN, p::EP_PCM_IN, p::EP_MIDI_OUT] {
+            let bytes = p::encode_rate(rate);
+            let set = self.handle.write_control(
+                p::SET_CUR_TYPE,
+                p::SET_CUR_REQ,
+                p::SET_CUR_VALUE,
+                ep as u16,
+                &bytes,
+                CTRL_TIMEOUT,
+            );
+            let got = self.get_sample_rate(ep);
+            println!(
+                "  ep 0x{ep:02X}: SET_CUR {} , GET_CUR {}",
+                match set {
+                    Ok(_) => "ok".to_string(),
+                    Err(e) => format!("{e:?}"),
+                },
+                match got {
+                    Ok(r) => format!("{r} Hz"),
+                    Err(e) => format!("{e:?}"),
+                }
+            );
+        }
     }
 
     /// Arm the device: read the status register and write it back with bit 5 set.
@@ -146,7 +195,7 @@ impl Ns6 {
     /// Defensive: a halted pipe is indistinguishable from a device that is simply
     /// ignoring us, and earlier failed transfers can leave one behind.
     pub fn clear_halts(&self) {
-        for ep in [p::EP_PCM_OUT, p::EP_MIDI_IN, p::EP_PCM_IN] {
+        for ep in [p::EP_MIDI_OUT, p::EP_MIDI_IN, p::EP_PCM_IN] {
             let _ = self.handle.clear_halt(ep);
         }
     }
@@ -175,9 +224,9 @@ impl Ns6 {
         Ok(())
     }
 
-    /// Write one bulk OUT transfer. Returns the number of bytes accepted.
-    pub fn write_pcm(&self, buf: &[u8]) -> Result<usize, Error> {
-        Ok(self.handle.write_bulk(p::EP_PCM_OUT, buf, XFER_TIMEOUT)?)
+    /// Write raw MIDI bytes to the controller (LEDs and display feedback).
+    pub fn write_midi(&self, buf: &[u8]) -> Result<usize, Error> {
+        Ok(self.handle.write_bulk(p::EP_MIDI_OUT, buf, XFER_TIMEOUT)?)
     }
 
     /// Raw libusb handle, for the isochronous streams.
@@ -186,81 +235,35 @@ impl Ns6 {
     pub fn raw_handle(&self) -> *mut rusb::ffi::libusb_device_handle {
         self.handle.as_raw()
     }
-
-    /// Read from a bulk IN endpoint. Returns the number of bytes received.
-    pub fn read_bulk(&self, ep: u8, buf: &mut [u8]) -> Result<usize, Error> {
-        Ok(self.handle.read_bulk(ep, buf, XFER_TIMEOUT)?)
-    }
 }
 
-/// Pump silence to the PCM OUT endpoint, embedding any MIDI from `midi_rx`.
+/// Forward MIDI from the host to the controller over the bulk OUT pipe.
 ///
-/// This is what keeps the device streaming, and therefore what makes it report
-/// its control surface at all.
-pub fn run_pcm_out(
+/// Audio output is the isochronous stream, not this endpoint, so nothing is
+/// written here unless the host actually sends something.
+pub fn run_midi_out(
     dev: Arc<Ns6>,
     stats: Arc<Stats>,
     running: Arc<AtomicBool>,
     midi_rx: Receiver<u8>,
 ) {
-    let mut buf = vec![0u8; p::OUT_XFER_SIZE];
+    let mut pending: Vec<u8> = Vec::new();
 
     while running.load(Ordering::Relaxed) {
-        let mut pending = midi_rx.try_iter();
-        let consumed = p::fill_out_buffer(&mut buf, &mut pending);
-        if consumed > 0 {
-            stats
-                .midi_out_bytes
-                .fetch_add(consumed as u64, Ordering::Relaxed);
+        pending.extend(midi_rx.try_iter());
+        if pending.is_empty() {
+            std::thread::sleep(Duration::from_millis(2));
+            continue;
         }
-
-        match dev.write_pcm(&buf) {
-            Ok(_) => {
+        match dev.write_midi(&pending) {
+            Ok(n) => {
                 stats.out_ok.fetch_add(1, Ordering::Relaxed);
+                stats.midi_out_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                pending.drain(..n.min(pending.len()));
             }
             Err(_) => {
                 stats.out_err.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-}
-
-/// Read the MIDI IN pipe, strip filler, and hand raw MIDI bytes to `sink`.
-pub fn run_midi_in(
-    dev: Arc<Ns6>,
-    stats: Arc<Stats>,
-    running: Arc<AtomicBool>,
-    mut sink: impl FnMut(&[u8]),
-) {
-    let mut raw = vec![0u8; p::BLOCK];
-    let mut clean = Vec::with_capacity(p::BLOCK);
-
-    while running.load(Ordering::Relaxed) {
-        match dev.read_bulk(p::EP_MIDI_IN, &mut raw) {
-            Ok(0) => {}
-            Ok(n) => {
-                clean.clear();
-                p::strip_midi_filler(&raw[..n], &mut clean);
-                if !clean.is_empty() {
-                    stats
-                        .midi_in_bytes
-                        .fetch_add(clean.len() as u64, Ordering::Relaxed);
-                    sink(&clean);
-                }
-            }
-            Err(_) => {} // timeouts are normal when the surface is idle
-        }
-    }
-}
-
-/// Drain the PCM IN pipe so the device is never blocked waiting on the host.
-pub fn run_pcm_in(dev: Arc<Ns6>, stats: Arc<Stats>, running: Arc<AtomicBool>) {
-    let mut buf = vec![0u8; 5120];
-
-    while running.load(Ordering::Relaxed) {
-        if let Ok(n) = dev.read_bulk(p::EP_PCM_IN, &mut buf) {
-            if n > 0 {
-                stats.pcm_in.fetch_add(1, Ordering::Relaxed);
+                pending.clear(); // do not wedge on a stuck pipe
             }
         }
     }

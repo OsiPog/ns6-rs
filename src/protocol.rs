@@ -10,31 +10,32 @@ pub const VID: u16 = 0x15E4;
 /// USB product ID of the original NS6 (the NS6II is a different, class-compliant device).
 pub const PID: u16 = 0x0079;
 
-/// PCM out, and the carrier for MIDI out and the control byte.
+/// MIDI out, on the MIDI interface (interface 0).
 ///
-/// `selectConfiguration()` picks the OUT pipe with the predicate
-/// `direction == OUT && bmAttributes & 3 == 2` (bulk), which on the NS6 selects
-/// endpoint `0x04`.
+/// This is **not** the audio output. `selectConfiguration()` has two branches:
+/// `FUN_f1017430` assigns a bulk OUT audio pipe, but its device list does not
+/// contain `15e4`, so the NS6 never takes it. `FUN_f1017490` does list
+/// `15e4:0079`, and that branch assigns the *isochronous* OUT pipe for audio and
+/// leaves the bulk OUT field null - so `bulkAudioOut()` never runs on this device.
 ///
-/// The driver runs the isochronous endpoints (`EP_ISO_OUT` / `EP_ISO_IN`) at the
-/// same time as this one; see their docs. Bulk alone is not sufficient.
-///
-/// Note that isochronous transfers are unacknowledged, so an iso-only
-/// implementation reports success regardless of what the device does. Whether
-/// *bulk* OUT transfers complete is the signal that actually means something.
-pub const EP_PCM_OUT: u8 = 0x04;
+/// Writing audio here just fills a small MIDI FIFO (1024 bytes, i.e. two 512-byte
+/// packets) which then never drains, and feeds junk to the device's MIDI parser.
+pub const EP_MIDI_OUT: u8 = 0x04;
 
 /// MIDI in. Ploytec's dedicated MIDI IN endpoint, on interface 0.
 pub const EP_MIDI_IN: u8 = 0x83;
 
-/// PCM in, selected by `direction == IN && bulk`.
+/// Audio in, selected by `direction == IN && bulk`.
 pub const EP_PCM_IN: u8 = 0x86;
 
-/// Isochronous OUT, selected by `OUT && iso && wMaxPacketSize > 0x20`.
+/// Isochronous OUT: **the audio output** for this device.
 ///
-/// The vendor driver runs this alongside the bulk pipes as a keep-alive that
-/// clocks the device (`requestIsocOut`, `m_pcOutPipeKeepAlive`). Driving bulk
-/// alone gets exactly one buffer accepted and then permanent NAK.
+/// Selected by `OUT && iso && wMaxPacketSize > 0x20` in the branch that lists
+/// `15e4:0079`. `requestIsocOut()` submits 0x28 = 40 packets per URB at high
+/// speed, each sized `bytes_per_frame * frames`, where the frame count comes
+/// from the pattern `InitFramePattern` builds. Sending the endpoint's full
+/// 156-byte max packet every microframe is far more audio than the sample rate
+/// calls for, and the device ignores the stream.
 pub const EP_ISO_OUT: u8 = 0x02;
 /// Max packet size of the isochronous OUT endpoint.
 pub const ISO_OUT_PACKET: usize = 156;
@@ -45,7 +46,8 @@ pub const EP_ISO_IN: u8 = 0x81;
 pub const ISO_IN_PACKET: usize = 64;
 
 /// Packets per isochronous transfer, and how many transfers to keep in flight.
-pub const ISO_PACKETS_PER_XFER: usize = 32;
+/// `requestIsocOut()` uses 0x28 = 40 packets per URB at high speed (5 at full speed).
+pub const ISO_PACKETS_PER_XFER: usize = 40;
 pub const ISO_XFERS: usize = 8;
 
 /// The device exposes two interfaces; both are claimed at alternate setting 1.
@@ -75,29 +77,11 @@ pub const VENDOR_OUT: u8 = 0x40;
 /// The only sample rate this driver configures. The device also supports 48/88.2/96 kHz.
 pub const SAMPLE_RATE: u32 = 44_100;
 
-/// One output sub-packet. `PGDevice::bulkAudioOut()` advances by `0x200` per block.
+/// Transfer size used for the MIDI IN pipe: the endpoint's max packet size.
 pub const BLOCK: usize = 512;
-/// Blocks per USB transfer: the driver's URB `TransferBufferLength` is `0x20000`.
-pub const BLOCKS_PER_XFER: usize = 256;
-/// Bytes per bulk OUT transfer (131072).
-pub const OUT_XFER_SIZE: usize = BLOCK * BLOCKS_PER_XFER;
 
-/// Offset of the MIDI-out byte within a block (`0x1E0`).
-pub const MIDI_SLOT: usize = 480;
-/// Offset of the control byte within a block (`0x1E1`).
-pub const CTRL_SLOT: usize = 481;
-
-/// Filler written to the MIDI slot when there is nothing to send. Also used by the
-/// device as padding on the MIDI IN pipe, so it must be stripped from received data.
+/// Filler the device pads the MIDI IN pipe with. Never real MIDI data there.
 pub const MIDI_IDLE: u8 = 0xFD;
-
-/// Steady-state value of the control byte.
-///
-/// The driver pops a command byte from a queue and ORs it with `0x18`. In steady
-/// state that queue is empty and the field is zero-initialised, so the byte is
-/// simply `0x18`. This is *not* the `0xFF` sync byte used by the Allen & Heath
-/// Xone members of the same chipset family.
-pub const CTRL_IDLE: u8 = 0x18;
 
 /// Output channel count for this PID at high speed, from `findInterfacesInConfig()`.
 pub const OUT_CHANNELS: usize = 4;
@@ -108,15 +92,14 @@ pub const BITS_PER_SAMPLE: usize = 24;
 
 /// Bytes per output audio frame: 4 channels x 3 bytes = 12.
 pub const OUT_FRAME_BYTES: usize = OUT_CHANNELS * BITS_PER_SAMPLE / 8;
-/// Audio frames per block: 480 / 12 = 40, exactly.
-pub const FRAMES_PER_BLOCK: usize = MIDI_SLOT / OUT_FRAME_BYTES;
+/// Audio frames per 512-byte block in the bulk framing: 480 / 12 = 40, exactly.
+/// Kept as a cross-check on the channel count and sample width.
+pub const FRAMES_PER_BLOCK: usize = 480 / OUT_FRAME_BYTES;
 
 // The audio region of a block must divide evenly into frames. If the channel
 // count or sample width were wrong, this would not hold - which is exactly what
 // corroborates the bulk framing derived from the driver.
-const _: () = assert!(FRAMES_PER_BLOCK * OUT_FRAME_BYTES == MIDI_SLOT);
-const _: () = assert!(MIDI_SLOT + 2 <= BLOCK);
-const _: () = assert!(CTRL_SLOT == MIDI_SLOT + 1);
+const _: () = assert!(FRAMES_PER_BLOCK * OUT_FRAME_BYTES == 480);
 const _: () = assert!(IN_CHANNELS <= OUT_CHANNELS);
 
 /// Compute the `wValue` for the arming write.
@@ -131,39 +114,6 @@ pub fn arm_wvalue(status: u8) -> u16 {
 /// Encode a sample rate as the 3-byte little-endian form used by `SET_CUR`.
 pub fn encode_rate(rate: u32) -> [u8; 3] {
     [rate as u8, (rate >> 8) as u8, (rate >> 16) as u8]
-}
-
-/// Fill a bulk OUT transfer buffer with silence, taking MIDI bytes from `midi_out`.
-///
-/// Layout per 512-byte block:
-///
-/// ```text
-/// bytes 0..480     audio (40 frames x 12 bytes) - zero here, i.e. silence
-/// byte  480        MIDI out byte, or MIDI_IDLE
-/// byte  481        control byte (CTRL_IDLE)
-/// bytes 482..512   padding
-/// ```
-///
-/// At most one MIDI byte per block is emitted, which is how the vendor driver
-/// rate-limits MIDI to stay within 31250 baud.
-///
-/// Returns the number of MIDI bytes consumed from `midi_out`.
-pub fn fill_out_buffer(buf: &mut [u8], midi_out: &mut impl Iterator<Item = u8>) -> usize {
-    debug_assert_eq!(buf.len(), OUT_XFER_SIZE);
-    buf.fill(0);
-
-    let mut consumed = 0;
-    for block in buf.chunks_exact_mut(BLOCK) {
-        block[MIDI_SLOT] = match midi_out.next() {
-            Some(byte) => {
-                consumed += 1;
-                byte
-            }
-            None => MIDI_IDLE,
-        };
-        block[CTRL_SLOT] = CTRL_IDLE;
-    }
-    consumed
 }
 
 /// Strip Ploytec filler from a MIDI IN transfer, leaving a raw MIDI byte stream.
@@ -184,8 +134,7 @@ mod tests {
         // if the channel count or sample width were wrong, this would not divide.
         assert_eq!(OUT_FRAME_BYTES, 12);
         assert_eq!(FRAMES_PER_BLOCK, 40);
-        assert_eq!(FRAMES_PER_BLOCK * OUT_FRAME_BYTES, MIDI_SLOT);
-        assert_eq!(OUT_XFER_SIZE, 0x20000);
+        assert_eq!(FRAMES_PER_BLOCK * OUT_FRAME_BYTES, 480);
     }
 
     #[test]
@@ -206,37 +155,28 @@ mod tests {
     }
 
     #[test]
-    fn idle_buffer_has_correct_slots() {
-        let mut buf = vec![0u8; OUT_XFER_SIZE];
-        let consumed = fill_out_buffer(&mut buf, &mut std::iter::empty());
-        assert_eq!(consumed, 0);
-
-        for block in buf.chunks_exact(BLOCK) {
+    fn frame_pattern_averages_the_sample_rate() {
+        // The isochronous OUT packets carry a variable number of frames so that
+        // the long-run average is exactly rate/8000 frames per microframe. At
+        // 44.1 kHz that is 5.5125, so packets must be 5 or 6 frames and one
+        // second of packets must carry exactly one second of audio.
+        let rate: u64 = SAMPLE_RATE as u64;
+        let mut acc: u64 = 0;
+        let mut total = 0u64;
+        for _ in 0..8000 {
+            acc += rate;
+            let frames = acc / 8000;
+            acc -= frames * 8000;
             assert!(
-                block[..MIDI_SLOT].iter().all(|&b| b == 0),
-                "audio not silent"
+                (5..=6).contains(&frames),
+                "implausible packet: {frames} frames"
             );
-            assert_eq!(block[MIDI_SLOT], MIDI_IDLE);
-            assert_eq!(block[CTRL_SLOT], CTRL_IDLE);
-            assert!(
-                block[CTRL_SLOT + 1..].iter().all(|&b| b == 0),
-                "padding dirty"
-            );
+            total += frames;
         }
-    }
-
-    #[test]
-    fn midi_out_goes_one_byte_per_block() {
-        let mut buf = vec![0u8; OUT_XFER_SIZE];
-        let msg = [0x90u8, 0x0B, 0x7F];
-        let consumed = fill_out_buffer(&mut buf, &mut msg.iter().copied());
-
-        assert_eq!(consumed, 3);
-        assert_eq!(buf[MIDI_SLOT], 0x90);
-        assert_eq!(buf[BLOCK + MIDI_SLOT], 0x0B);
-        assert_eq!(buf[2 * BLOCK + MIDI_SLOT], 0x7F);
-        // Everything after the message falls back to idle.
-        assert_eq!(buf[3 * BLOCK + MIDI_SLOT], MIDI_IDLE);
+        assert_eq!(
+            total, rate,
+            "one second of packets must carry one second of audio"
+        );
     }
 
     #[test]

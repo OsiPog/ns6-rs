@@ -97,6 +97,7 @@ fn cmd_run() -> Result<(), Box<dyn std::error::Error>> {
             p::ISO_OUT_PACKET,
             p::ISO_PACKETS_PER_XFER,
             p::ISO_XFERS,
+            Some((p::OUT_FRAME_BYTES, p::SAMPLE_RATE as u64)),
         )
     }
     .map_err(|e| format!("iso OUT stream: libusb error {e}"))?;
@@ -107,6 +108,7 @@ fn cmd_run() -> Result<(), Box<dyn std::error::Error>> {
             p::ISO_IN_PACKET,
             p::ISO_PACKETS_PER_XFER,
             4,
+            None,
         )
     }
     .map_err(|e| format!("iso IN stream: libusb error {e}"))?;
@@ -124,27 +126,19 @@ fn cmd_run() -> Result<(), Box<dyn std::error::Error>> {
 
     // MIDI destined for the controller (LEDs), consumed by the PCM out thread.
     let (midi_tx, midi_rx) = mpsc::channel::<u8>();
-    // MIDI arriving from the controller, published on the ALSA port by main.
-    // MidiPort holds a raw snd_midi_event_t and so cannot cross threads.
-    let (surface_tx, surface_rx) = mpsc::channel::<Vec<u8>>();
 
     let mut threads = Vec::new();
     threads.push(thread::spawn({
         let (dev, stats, running) = (dev.clone(), stats.clone(), alive.clone());
-        move || device::run_pcm_out(dev, stats, running, midi_rx)
+        move || device::run_midi_out(dev, stats, running, midi_rx)
     }));
-    threads.push(thread::spawn({
-        let (dev, stats, running) = (dev.clone(), stats.clone(), alive.clone());
-        move || {
-            device::run_midi_in(dev, stats, running, |bytes| {
-                let _ = surface_tx.send(bytes.to_vec());
-            })
-        }
-    }));
-    threads.push(thread::spawn({
-        let (dev, stats, running) = (dev.clone(), stats.clone(), alive.clone());
-        move || device::run_pcm_in(dev, stats, running)
-    }));
+    // MIDI and audio in come off async bulk queues, drained in the main loop.
+    let _midi_in =
+        unsafe { iso::BulkInStream::start(dev.raw_handle(), p::EP_MIDI_IN, p::BLOCK, 8, true) }
+            .map_err(|e| format!("MIDI in queue: libusb error {e}"))?;
+    let _audio_in =
+        unsafe { iso::BulkInStream::start(dev.raw_handle(), p::EP_PCM_IN, 5120, 8, false) }
+            .map_err(|e| format!("audio in queue: libusb error {e}"))?;
 
     println!(
         "\nbridge running - connect Mixxx to \"{}\". Ctrl-C to stop.\n",
@@ -157,8 +151,11 @@ fn cmd_run() -> Result<(), Box<dyn std::error::Error>> {
 
     while running() {
         // Surface events from the device -> ALSA.
-        for chunk in surface_rx.try_iter() {
-            port.send_bytes(&chunk);
+        if let Ok(mut q) = iso::MIDI_IN.lock() {
+            if !q.is_empty() {
+                port.send_bytes(&q);
+                q.clear();
+            }
         }
 
         // LED feedback from the host -> device.
@@ -175,12 +172,12 @@ fn cmd_run() -> Result<(), Box<dyn std::error::Error>> {
             let ok = stats.out_ok.load(Ordering::Relaxed);
             let err = stats.out_err.load(Ordering::Relaxed);
             println!(
-                "  pcm-out[ok:{ok} err:{err}]  pcm-in:{}  iso-out:{}  iso-in:{}/{}B  midi-in:{} bytes  midi-out:{} bytes",
-                stats.pcm_in.load(Ordering::Relaxed),
+                "  midi-out[ok:{ok} err:{err}]  iso-out:{}  iso-in:{}/{}B  bulk-in:{}B  midi-in:{} bytes  midi-out:{} bytes",
                 iso::ISO_OUT_OK.load(Ordering::Relaxed),
                 iso::ISO_IN_OK.load(Ordering::Relaxed),
                 iso::ISO_IN_DATA.load(Ordering::Relaxed),
-                stats.midi_in_bytes.load(Ordering::Relaxed),
+                iso::BULK_IN_BYTES.load(Ordering::Relaxed),
+                iso::MIDI_IN_BYTES.load(Ordering::Relaxed),
                 stats.midi_out_bytes.load(Ordering::Relaxed),
             );
             if !warned && ok == 0 && err > 0 {
@@ -219,7 +216,8 @@ fn cmd_probe() -> Result<(), Box<dyn std::error::Error>> {
             .join(" ")
     );
     println!("status   : 0x{:02X}", dev.status()?);
-    dev.set_sample_rate(p::SAMPLE_RATE)?;
+    println!("sample rate:");
+    dev.set_sample_rate_verbose(p::SAMPLE_RATE);
     let (before, after) = dev.arm()?;
     println!("armed    : 0x{before:02X} -> 0x{after:02X}");
     dev.clear_halts();
@@ -232,6 +230,7 @@ fn cmd_probe() -> Result<(), Box<dyn std::error::Error>> {
             p::ISO_OUT_PACKET,
             p::ISO_PACKETS_PER_XFER,
             p::ISO_XFERS,
+            Some((p::OUT_FRAME_BYTES, p::SAMPLE_RATE as u64)),
         )
     };
     let iso_in = unsafe {
@@ -241,6 +240,7 @@ fn cmd_probe() -> Result<(), Box<dyn std::error::Error>> {
             p::ISO_IN_PACKET,
             p::ISO_PACKETS_PER_XFER,
             4,
+            None,
         )
     };
     match (&iso_out, &iso_in) {
@@ -270,52 +270,54 @@ fn cmd_probe() -> Result<(), Box<dyn std::error::Error>> {
         iso::ISO_IN_DATA.load(Ordering::Relaxed),
     );
 
-    println!(
-        "\nsweeping bulk OUT 0x{:02X} (5 attempts each)",
-        p::EP_PCM_OUT
-    );
-    println!("{:<9} {:<10} {:<6} accepted", "size", "framing", "ctrl");
+    // Async bulk IN queues, mirroring the driver's 8-deep URB queues. A single
+    // blocking read leaves gaps where nothing is posted.
+    let _midi_in =
+        unsafe { iso::BulkInStream::start(dev.raw_handle(), p::EP_MIDI_IN, p::BLOCK, 8, true) };
+    let _audio_in =
+        unsafe { iso::BulkInStream::start(dev.raw_handle(), p::EP_PCM_IN, 5120, 8, false) };
+    match (&_midi_in, &_audio_in) {
+        (Ok(_), Ok(_)) => println!("bulk in  : queues up on 0x83 and 0x86"),
+        _ => println!(
+            "bulk in  : FAILED (midi {:?}, audio {:?})",
+            _midi_in.as_ref().err(),
+            _audio_in.as_ref().err()
+        ),
+    }
 
-    let sizes = [
-        512usize,
-        1024,
-        2048,
-        4096,
-        8192,
-        16384,
-        65536,
-        p::OUT_XFER_SIZE,
-    ];
-    let mut any = false;
+    println!("\nwatching for device activity for 20s (move controls now)\n");
 
-    for size in sizes {
-        for (label, framed, ctrl) in [
-            ("zeros", false, 0x00u8),
-            ("ploytec", true, p::CTRL_IDLE),
-            ("ploytec", true, 0xFF),
-        ] {
-            let mut buf = vec![0u8; size];
-            if framed {
-                for block in buf.chunks_exact_mut(p::BLOCK) {
-                    block[p::MIDI_SLOT] = p::MIDI_IDLE;
-                    block[p::CTRL_SLOT] = ctrl;
-                }
-            }
-
-            let mut ok = 0;
-            for _ in 0..5 {
-                if dev.write_pcm(&buf).is_ok() {
-                    ok += 1;
-                }
-            }
-            println!("{size:<9} {label:<10} 0x{ctrl:02X}   {ok}/5");
-            if ok > 0 {
-                any = true;
-                println!("  *** accepted - draining MIDI pipe for 2s");
-                drain_midi(&dev, Duration::from_secs(2));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last = Instant::now();
+    while Instant::now() < deadline {
+        if let Ok(mut q) = iso::MIDI_IN.lock() {
+            if !q.is_empty() {
+                println!(
+                    "  MIDI: {}",
+                    q.iter()
+                        .map(|b| format!("{b:02X}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                q.clear();
             }
         }
+        thread::sleep(Duration::from_millis(20));
+        if last.elapsed() >= Duration::from_secs(5) {
+            last = Instant::now();
+            println!(
+                "  iso-out:{} iso-in:{}/{}B  bulk-in:{} xfers/{}B  midi:{}B",
+                iso::ISO_OUT_OK.load(Ordering::Relaxed),
+                iso::ISO_IN_OK.load(Ordering::Relaxed),
+                iso::ISO_IN_DATA.load(Ordering::Relaxed),
+                iso::BULK_IN_OK.load(Ordering::Relaxed),
+                iso::BULK_IN_BYTES.load(Ordering::Relaxed),
+                iso::MIDI_IN_BYTES.load(Ordering::Relaxed),
+            );
+        }
     }
+    let any = iso::ISO_IN_DATA.load(Ordering::Relaxed) > 0
+        || iso::BULK_IN_BYTES.load(Ordering::Relaxed) > 0;
 
     pump_alive.store(false, Ordering::Relaxed);
     iso::ISO_RUNNING.store(false, Ordering::Relaxed);
@@ -324,38 +326,9 @@ fn cmd_probe() -> Result<(), Box<dyn std::error::Error>> {
     drop(iso_in);
 
     if !any {
-        println!(
-            "\nNo bulk OUT configuration was accepted. The device is not entering its\n\
-             streaming state, so something earlier in the sequence is still missing."
-        );
+        println!("\nNo audio came back from the device, so it is still not streaming.");
     }
     Ok(())
-}
-
-fn drain_midi(dev: &Ns6, how_long: Duration) {
-    let deadline = Instant::now() + how_long;
-    let mut raw = vec![0u8; p::BLOCK];
-    let mut clean = Vec::new();
-
-    while Instant::now() < deadline {
-        if let Ok(n) = dev.read_bulk(p::EP_MIDI_IN, &mut raw) {
-            if n == 0 {
-                continue;
-            }
-            clean.clear();
-            p::strip_midi_filler(&raw[..n], &mut clean);
-            if !clean.is_empty() {
-                println!(
-                    "      MIDI: {}",
-                    clean
-                        .iter()
-                        .map(|b| format!("{b:02X}"))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                );
-            }
-        }
-    }
 }
 
 /// Emit synthetic MIDI so the ALSA path can be verified without hardware.
