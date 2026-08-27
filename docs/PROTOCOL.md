@@ -48,21 +48,28 @@ m_pcMidiInterface = getAltSetting(iface, 1);      // alt setting 1
 predicates (`+0x10` = `bEndpointAddress`, `+0x12` = `bmAttributes`, `+0x18` =
 `wMaxPacketSize`; type bits 1=iso, 2=bulk, 3=interrupt):
 
-| Predicate | Test | NS6 endpoint |
+| Field | Predicate | NS6 endpoint |
 |---|---|---|
-| OUT pipe | `OUT && bmAttributes&3 == 2` (bulk) | **`0x04`** |
-| IN pipe | `IN && bmAttributes&3 == 2` (bulk) | **`0x86`** |
-| IN fallback | `IN && type == 3` (interrupt) | none |
-| feedback | `OUT && iso && wMaxPacketSize == 4` | none |
+| `0x16b0` | `OUT && bmAttributes&3 == 2` (bulk) | **`0x04`** |
+| `0x16a8` | `IN && bmAttributes&3 == 2` (bulk) | **`0x86`** |
+| `0x16a8` fallback | `IN && type == 3` (interrupt) | none |
+| `0x16c8` | `OUT && iso && wMaxPacketSize == 4` (feedback) | none |
+| `0x16d8` | `OUT && iso && wMaxPacketSize > 0x20` | **`0x02`** |
+| `0x16c0` | `IN && iso && wMaxPacketSize > 0x20` | **`0x81`** |
 
-So **PCM out = bulk `0x04`, PCM in = bulk `0x86`, MIDI in = bulk `0x83`**.
+So **PCM out = bulk `0x04`, PCM in = bulk `0x86`, MIDI in = bulk `0x83`** — and the
+driver *also* runs **isochronous `0x02` and `0x81`** alongside them. The isochronous
+side is the keep-alive that clocks the device (`requestIsocOut`,
+`requestIOKeepAlive`, `m_pcOutPipeKeepAlive`, `isocWriteCompleteKeepAlive`).
 
-> **The isochronous OUT endpoint `0x02` is never used by the vendor driver.** It is
-> only considered as a 4-byte feedback pipe, and the NS6's is 156 bytes. This matters
-> because isochronous transfers are *unacknowledged*: streaming to `0x02` reports
-> success no matter what the device does with it. During this work, 7.19 million iso
-> packets were sent with "zero errors" while the device ignored every one of them.
-> Any success metric that cannot fail is not a success metric.
+Both halves are needed. Driving isochronous alone achieves nothing; driving bulk
+alone gets exactly one buffer accepted and then permanent NAK.
+
+> **Isochronous transfers are unacknowledged**, so an iso-only implementation reports
+> success no matter what the device does with the data. During this work 7.19 million
+> iso packets were sent with "zero errors" while nothing happened. Any success metric
+> that cannot fail is not a success metric — for this device the meaningful signal is
+> whether **bulk** OUT transfers complete.
 
 ## Channel layout
 

@@ -18,7 +18,8 @@ sequencer MIDI port in its place.
 | Vendor handshake (`'V'`, `'I'`, sample rate, arm) | done, verified on hardware |
 | Endpoint roles and packet framing | done, from driver decompilation |
 | ALSA MIDI port visible to Mixxx/PortMidi | done, verified with `aseqdump` |
-| **Device accepting the PCM OUT stream** | **not yet working** |
+| Isochronous keep-alive streams | running, verified on hardware |
+| **Device accepting the bulk PCM OUT stream** | **not yet working** |
 | MIDI from the control surface | blocked on the above |
 | Mixxx mapping | not written — needs a real control capture first |
 

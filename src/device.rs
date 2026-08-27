@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rusb::{DeviceHandle, GlobalContext};
@@ -55,7 +55,7 @@ pub struct Stats {
 }
 
 pub struct Ns6 {
-    handle: Mutex<DeviceHandle<GlobalContext>>,
+    handle: DeviceHandle<GlobalContext>,
 }
 
 impl Ns6 {
@@ -74,15 +74,13 @@ impl Ns6 {
             handle.set_alternate_setting(iface, p::ALT_SETTING)?;
         }
 
-        Ok(Self {
-            handle: Mutex::new(handle),
-        })
+        Ok(Self { handle })
     }
 
     /// Read the 15-byte firmware version block (vendor request `'V'`).
     pub fn firmware(&self) -> Result<Vec<u8>, Error> {
         let mut buf = [0u8; 15];
-        let n = self.handle.lock().unwrap().read_control(
+        let n = self.handle.read_control(
             p::VENDOR_IN,
             p::CMD_FIRMWARE,
             0,
@@ -96,7 +94,7 @@ impl Ns6 {
     /// Read the hardware status register (vendor request `'I'`, register 0).
     pub fn status(&self) -> Result<u8, Error> {
         let mut buf = [0u8; 1];
-        self.handle.lock().unwrap().read_control(
+        self.handle.read_control(
             p::VENDOR_IN,
             p::CMD_STATUS,
             0,
@@ -110,9 +108,8 @@ impl Ns6 {
     /// Set the sample rate on both PCM endpoints (audio class `SET_CUR`).
     pub fn set_sample_rate(&self, rate: u32) -> Result<(), Error> {
         let bytes = p::encode_rate(rate);
-        let handle = self.handle.lock().unwrap();
         for ep in [p::EP_PCM_IN, p::EP_PCM_OUT] {
-            handle.write_control(
+            self.handle.write_control(
                 p::SET_CUR_TYPE,
                 p::SET_CUR_REQ,
                 p::SET_CUR_VALUE,
@@ -132,7 +129,7 @@ impl Ns6 {
     pub fn arm(&self) -> Result<(u8, u8), Error> {
         let before = self.status()?;
         let wvalue = p::arm_wvalue(before);
-        self.handle.lock().unwrap().write_control(
+        self.handle.write_control(
             p::VENDOR_OUT,
             p::CMD_STATUS,
             wvalue,
@@ -149,9 +146,8 @@ impl Ns6 {
     /// Defensive: a halted pipe is indistinguishable from a device that is simply
     /// ignoring us, and earlier failed transfers can leave one behind.
     pub fn clear_halts(&self) {
-        let handle = self.handle.lock().unwrap();
         for ep in [p::EP_PCM_OUT, p::EP_MIDI_IN, p::EP_PCM_IN] {
-            let _ = handle.clear_halt(ep);
+            let _ = self.handle.clear_halt(ep);
         }
     }
 
@@ -181,26 +177,21 @@ impl Ns6 {
 
     /// Write one bulk OUT transfer. Returns the number of bytes accepted.
     pub fn write_pcm(&self, buf: &[u8]) -> Result<usize, Error> {
-        Ok(self
-            .handle
-            .lock()
-            .unwrap()
-            .write_bulk(p::EP_PCM_OUT, buf, XFER_TIMEOUT)?)
+        Ok(self.handle.write_bulk(p::EP_PCM_OUT, buf, XFER_TIMEOUT)?)
+    }
+
+    /// Raw libusb handle, for the isochronous streams.
+    ///
+    /// `rusb` has no isochronous API, so `iso::IsoStream` drives libusb directly.
+    pub fn raw_handle(&self) -> *mut rusb::ffi::libusb_device_handle {
+        self.handle.as_raw()
     }
 
     /// Read from a bulk IN endpoint. Returns the number of bytes received.
     pub fn read_bulk(&self, ep: u8, buf: &mut [u8]) -> Result<usize, Error> {
-        Ok(self
-            .handle
-            .lock()
-            .unwrap()
-            .read_bulk(ep, buf, XFER_TIMEOUT)?)
+        Ok(self.handle.read_bulk(ep, buf, XFER_TIMEOUT)?)
     }
 }
-
-// The handle is only touched under its mutex, so it is safe to share.
-unsafe impl Send for Ns6 {}
-unsafe impl Sync for Ns6 {}
 
 /// Pump silence to the PCM OUT endpoint, embedding any MIDI from `midi_rx`.
 ///

@@ -7,6 +7,7 @@
 //! See `docs/PROTOCOL.md` for how the protocol was derived.
 
 mod device;
+mod iso;
 mod midi;
 mod protocol;
 
@@ -87,6 +88,40 @@ fn cmd_run() -> Result<(), Box<dyn std::error::Error>> {
     let alive = Arc::new(AtomicBool::new(true));
     install_signal_handler();
 
+    // The isochronous streams clock the device. Without them the bulk PCM pipe
+    // accepts one buffer and then NAKs forever.
+    let _iso_out = unsafe {
+        iso::IsoStream::start(
+            dev.raw_handle(),
+            p::EP_ISO_OUT,
+            p::ISO_OUT_PACKET,
+            p::ISO_PACKETS_PER_XFER,
+            p::ISO_XFERS,
+        )
+    }
+    .map_err(|e| format!("iso OUT stream: libusb error {e}"))?;
+    let _iso_in = unsafe {
+        iso::IsoStream::start(
+            dev.raw_handle(),
+            p::EP_ISO_IN,
+            p::ISO_IN_PACKET,
+            p::ISO_PACKETS_PER_XFER,
+            4,
+        )
+    }
+    .map_err(|e| format!("iso IN stream: libusb error {e}"))?;
+    println!("isochronous streams running on 0x02 / 0x81");
+
+    // Drives the isochronous completion callbacks.
+    let pump = thread::spawn({
+        let alive = alive.clone();
+        move || {
+            while alive.load(Ordering::Relaxed) {
+                iso::pump_events();
+            }
+        }
+    });
+
     // MIDI destined for the controller (LEDs), consumed by the PCM out thread.
     let (midi_tx, midi_rx) = mpsc::channel::<u8>();
     // MIDI arriving from the controller, published on the ALSA port by main.
@@ -140,8 +175,11 @@ fn cmd_run() -> Result<(), Box<dyn std::error::Error>> {
             let ok = stats.out_ok.load(Ordering::Relaxed);
             let err = stats.out_err.load(Ordering::Relaxed);
             println!(
-                "  pcm-out[ok:{ok} err:{err}]  pcm-in:{}  midi-in:{} bytes  midi-out:{} bytes",
+                "  pcm-out[ok:{ok} err:{err}]  pcm-in:{}  iso-out:{}  iso-in:{}/{}B  midi-in:{} bytes  midi-out:{} bytes",
                 stats.pcm_in.load(Ordering::Relaxed),
+                iso::ISO_OUT_OK.load(Ordering::Relaxed),
+                iso::ISO_IN_OK.load(Ordering::Relaxed),
+                iso::ISO_IN_DATA.load(Ordering::Relaxed),
                 stats.midi_in_bytes.load(Ordering::Relaxed),
                 stats.midi_out_bytes.load(Ordering::Relaxed),
             );
@@ -158,6 +196,8 @@ fn cmd_run() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\nshutting down");
     alive.store(false, Ordering::Relaxed);
+    iso::ISO_RUNNING.store(false, Ordering::Relaxed);
+    let _ = pump.join();
     for t in threads {
         let _ = t.join();
     }
@@ -183,6 +223,52 @@ fn cmd_probe() -> Result<(), Box<dyn std::error::Error>> {
     let (before, after) = dev.arm()?;
     println!("armed    : 0x{before:02X} -> 0x{after:02X}");
     dev.clear_halts();
+
+    // Start the isochronous streams first: this is what clocks the device.
+    let iso_out = unsafe {
+        iso::IsoStream::start(
+            dev.raw_handle(),
+            p::EP_ISO_OUT,
+            p::ISO_OUT_PACKET,
+            p::ISO_PACKETS_PER_XFER,
+            p::ISO_XFERS,
+        )
+    };
+    let iso_in = unsafe {
+        iso::IsoStream::start(
+            dev.raw_handle(),
+            p::EP_ISO_IN,
+            p::ISO_IN_PACKET,
+            p::ISO_PACKETS_PER_XFER,
+            4,
+        )
+    };
+    match (&iso_out, &iso_in) {
+        (Ok(_), Ok(_)) => println!("iso      : streams up on 0x02 and 0x81"),
+        _ => println!(
+            "iso      : FAILED to start (out err {:?}, in err {:?})",
+            iso_out.as_ref().err(),
+            iso_in.as_ref().err()
+        ),
+    }
+
+    iso::ISO_IN_DUMP.store(true, Ordering::Relaxed);
+    let pump_alive = Arc::new(AtomicBool::new(true));
+    let pump = thread::spawn({
+        let alive = pump_alive.clone();
+        move || {
+            while alive.load(Ordering::Relaxed) {
+                iso::pump_events();
+            }
+        }
+    });
+    thread::sleep(Duration::from_millis(500));
+    println!(
+        "iso      : out {} pkts, in {} pkts / {} bytes after 0.5s",
+        iso::ISO_OUT_OK.load(Ordering::Relaxed),
+        iso::ISO_IN_OK.load(Ordering::Relaxed),
+        iso::ISO_IN_DATA.load(Ordering::Relaxed),
+    );
 
     println!(
         "\nsweeping bulk OUT 0x{:02X} (5 attempts each)",
@@ -230,6 +316,12 @@ fn cmd_probe() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+
+    pump_alive.store(false, Ordering::Relaxed);
+    iso::ISO_RUNNING.store(false, Ordering::Relaxed);
+    let _ = pump.join();
+    drop(iso_out);
+    drop(iso_in);
 
     if !any {
         println!(

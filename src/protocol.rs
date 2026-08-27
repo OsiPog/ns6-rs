@@ -16,11 +16,12 @@ pub const PID: u16 = 0x0079;
 /// `direction == OUT && bmAttributes & 3 == 2` (bulk), which on the NS6 selects
 /// endpoint `0x04`.
 ///
-/// Note the isochronous OUT endpoint `0x02` is **not** used by the vendor driver.
-/// It is only ever considered as a feedback pipe, via the predicate
-/// `OUT && isochronous && wMaxPacketSize == 4`, and the NS6's is 156 bytes.
-/// Isochronous transfers are unacknowledged, so streaming to `0x02` looks
-/// successful while achieving nothing.
+/// The driver runs the isochronous endpoints (`EP_ISO_OUT` / `EP_ISO_IN`) at the
+/// same time as this one; see their docs. Bulk alone is not sufficient.
+///
+/// Note that isochronous transfers are unacknowledged, so an iso-only
+/// implementation reports success regardless of what the device does. Whether
+/// *bulk* OUT transfers complete is the signal that actually means something.
 pub const EP_PCM_OUT: u8 = 0x04;
 
 /// MIDI in. Ploytec's dedicated MIDI IN endpoint, on interface 0.
@@ -28,6 +29,24 @@ pub const EP_MIDI_IN: u8 = 0x83;
 
 /// PCM in, selected by `direction == IN && bulk`.
 pub const EP_PCM_IN: u8 = 0x86;
+
+/// Isochronous OUT, selected by `OUT && iso && wMaxPacketSize > 0x20`.
+///
+/// The vendor driver runs this alongside the bulk pipes as a keep-alive that
+/// clocks the device (`requestIsocOut`, `m_pcOutPipeKeepAlive`). Driving bulk
+/// alone gets exactly one buffer accepted and then permanent NAK.
+pub const EP_ISO_OUT: u8 = 0x02;
+/// Max packet size of the isochronous OUT endpoint.
+pub const ISO_OUT_PACKET: usize = 156;
+
+/// Isochronous IN, selected by `IN && iso && wMaxPacketSize > 0x20`.
+pub const EP_ISO_IN: u8 = 0x81;
+/// Max packet size of the isochronous IN endpoint.
+pub const ISO_IN_PACKET: usize = 64;
+
+/// Packets per isochronous transfer, and how many transfers to keep in flight.
+pub const ISO_PACKETS_PER_XFER: usize = 32;
+pub const ISO_XFERS: usize = 8;
 
 /// The device exposes two interfaces; both are claimed at alternate setting 1.
 pub const INTERFACES: [u8; 2] = [0, 1];
