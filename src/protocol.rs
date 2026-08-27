@@ -77,6 +77,13 @@ pub const VENDOR_OUT: u8 = 0x40;
 /// The only sample rate this driver configures. The device also supports 48/88.2/96 kHz.
 pub const SAMPLE_RATE: u32 = 44_100;
 
+/// Audio-in transfer size.
+///
+/// From `captures/ns6.pcap`: the device delivers bulk IN `0x86` in transfers of
+/// 0x20000 = 131072 bytes. Posting a smaller buffer makes libusb fail the
+/// transfer with `OVERFLOW` rather than returning a short read.
+pub const AUDIO_IN_XFER: usize = 0x20000;
+
 /// Transfer size used for the MIDI IN pipe: the endpoint's max packet size.
 pub const BLOCK: usize = 512;
 
@@ -116,12 +123,27 @@ pub fn encode_rate(rate: u32) -> [u8; 3] {
     [rate as u8, (rate >> 8) as u8, (rate >> 16) as u8]
 }
 
-/// Strip Ploytec filler from a MIDI IN transfer, leaving a raw MIDI byte stream.
+/// Extract the MIDI byte stream from a MIDI IN transfer.
 ///
-/// The device pads the pipe with `MIDI_IDLE` (and zeroes); neither can appear as
-/// real MIDI data in this position.
+/// The device lays each packet out as the MIDI bytes, then a run of `0xFD`
+/// filler, then a trailing `0x00`:
+///
+/// ```text
+/// B0 07 7F B0 27 34 FD FD FD ... FD 00
+/// ```
+///
+/// So the payload is everything before the first `0xFD`.
+///
+/// It is important *not* to filter `0x00` out of the stream: zero is a
+/// perfectly legal MIDI data byte, and controls that emit it - a jog wheel at
+/// rest, a fader at the bottom - would otherwise slide the parse out of
+/// alignment and produce garbage.
 pub fn strip_midi_filler(raw: &[u8], out: &mut Vec<u8>) {
-    out.extend(raw.iter().copied().filter(|&b| b != MIDI_IDLE && b != 0x00));
+    let end = raw
+        .iter()
+        .position(|&b| b == MIDI_IDLE)
+        .unwrap_or(raw.len());
+    out.extend_from_slice(&raw[..end]);
 }
 
 #[cfg(test)]
@@ -192,12 +214,28 @@ mod tests {
     }
 
     #[test]
-    fn filler_stripping_keeps_valid_data_bytes() {
-        // 0x00 and 0xFD are stripped, but every other value must survive - in
-        // particular 0x7F and 0xFE, which are legitimate MIDI bytes.
-        let raw = [0x90, 0x7F, MIDI_IDLE, 0x00, 0xFE, 0x40];
+    fn zero_data_bytes_survive_stripping() {
+        // Regression: 0x00 is a legal MIDI data value. Filtering it out (rather
+        // than cutting at the first 0xFD) slides the parse out of alignment and
+        // turns jog-wheel traffic into garbage.
+        let mut raw = vec![0xB1, 0x20, 0x00, 0xB1, 0x21, 0x00];
+        raw.resize(42, MIDI_IDLE);
+        raw.push(0x00);
+
         let mut out = Vec::new();
         strip_midi_filler(&raw, &mut out);
-        assert_eq!(out, vec![0x90, 0x7F, 0xFE, 0x40]);
+        assert_eq!(out, vec![0xB1, 0x20, 0x00, 0xB1, 0x21, 0x00]);
+    }
+
+    #[test]
+    fn real_capture_packet_decodes() {
+        // Taken verbatim from captures/ns6.pcap: crossfader MSB+LSB.
+        let mut raw = vec![0xB0, 0x07, 0x7F, 0xB0, 0x27, 0x34];
+        raw.resize(41, MIDI_IDLE);
+        raw.push(0x00);
+
+        let mut out = Vec::new();
+        strip_midi_filler(&raw, &mut out);
+        assert_eq!(out, vec![0xB0, 0x07, 0x7F, 0xB0, 0x27, 0x34]);
     }
 }

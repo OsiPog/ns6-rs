@@ -88,19 +88,12 @@ fn cmd_run() -> Result<(), Box<dyn std::error::Error>> {
     let alive = Arc::new(AtomicBool::new(true));
     install_signal_handler();
 
-    // The isochronous streams clock the device. Without them the bulk PCM pipe
-    // accepts one buffer and then NAKs forever.
-    let _iso_out = unsafe {
-        iso::IsoStream::start(
-            dev.raw_handle(),
-            p::EP_ISO_OUT,
-            p::ISO_OUT_PACKET,
-            p::ISO_PACKETS_PER_XFER,
-            p::ISO_XFERS,
-            Some((p::OUT_FRAME_BYTES, p::SAMPLE_RATE as u64)),
-        )
+    // Submit in the order the Windows driver does: audio in, iso in, iso out,
+    // then MIDI in.
+    let _audio_in = unsafe {
+        iso::BulkInStream::start(dev.raw_handle(), p::EP_PCM_IN, p::AUDIO_IN_XFER, 8, false)
     }
-    .map_err(|e| format!("iso OUT stream: libusb error {e}"))?;
+    .map_err(|e| format!("audio in queue: libusb error {e}"))?;
     let _iso_in = unsafe {
         iso::IsoStream::start(
             dev.raw_handle(),
@@ -112,9 +105,23 @@ fn cmd_run() -> Result<(), Box<dyn std::error::Error>> {
         )
     }
     .map_err(|e| format!("iso IN stream: libusb error {e}"))?;
-    println!("isochronous streams running on 0x02 / 0x81");
+    let _iso_out = unsafe {
+        iso::IsoStream::start(
+            dev.raw_handle(),
+            p::EP_ISO_OUT,
+            p::ISO_OUT_PACKET,
+            p::ISO_PACKETS_PER_XFER,
+            p::ISO_XFERS,
+            Some((p::OUT_FRAME_BYTES, p::SAMPLE_RATE as u64)),
+        )
+    }
+    .map_err(|e| format!("iso OUT stream: libusb error {e}"))?;
+    let _midi_in =
+        unsafe { iso::BulkInStream::start(dev.raw_handle(), p::EP_MIDI_IN, p::BLOCK, 8, true) }
+            .map_err(|e| format!("MIDI in queue: libusb error {e}"))?;
+    println!("streams up: 0x86, 0x81, 0x02, 0x83");
 
-    // Drives the isochronous completion callbacks.
+    // Drives the isochronous and bulk completion callbacks.
     let pump = thread::spawn({
         let alive = alive.clone();
         move || {
@@ -136,9 +143,10 @@ fn cmd_run() -> Result<(), Box<dyn std::error::Error>> {
     let _midi_in =
         unsafe { iso::BulkInStream::start(dev.raw_handle(), p::EP_MIDI_IN, p::BLOCK, 8, true) }
             .map_err(|e| format!("MIDI in queue: libusb error {e}"))?;
-    let _audio_in =
-        unsafe { iso::BulkInStream::start(dev.raw_handle(), p::EP_PCM_IN, 5120, 8, false) }
-            .map_err(|e| format!("audio in queue: libusb error {e}"))?;
+    let _audio_in = unsafe {
+        iso::BulkInStream::start(dev.raw_handle(), p::EP_PCM_IN, p::AUDIO_IN_XFER, 8, false)
+    }
+    .map_err(|e| format!("audio in queue: libusb error {e}"))?;
 
     println!(
         "\nbridge running - connect Mixxx to \"{}\". Ctrl-C to stop.\n",
@@ -172,11 +180,13 @@ fn cmd_run() -> Result<(), Box<dyn std::error::Error>> {
             let ok = stats.out_ok.load(Ordering::Relaxed);
             let err = stats.out_err.load(Ordering::Relaxed);
             println!(
-                "  midi-out[ok:{ok} err:{err}]  iso-out:{}  iso-in:{}/{}B  bulk-in:{}B  midi-in:{} bytes  midi-out:{} bytes",
+                "  midi-out[ok:{ok} err:{err}]  iso-out:{}  iso-in:{}/{}B  bulk-in:{}B(err {} st {})  midi-in:{} bytes  midi-out:{} bytes",
                 iso::ISO_OUT_OK.load(Ordering::Relaxed),
                 iso::ISO_IN_OK.load(Ordering::Relaxed),
                 iso::ISO_IN_DATA.load(Ordering::Relaxed),
                 iso::BULK_IN_BYTES.load(Ordering::Relaxed),
+                iso::BULK_IN_ERR.load(Ordering::Relaxed),
+                iso::LAST_BULK_STATUS.load(Ordering::Relaxed),
                 iso::MIDI_IN_BYTES.load(Ordering::Relaxed),
                 stats.midi_out_bytes.load(Ordering::Relaxed),
             );
@@ -283,8 +293,9 @@ fn cmd_probe() -> Result<(), Box<dyn std::error::Error>> {
     // blocking read leaves gaps where nothing is posted.
     let _midi_in =
         unsafe { iso::BulkInStream::start(dev.raw_handle(), p::EP_MIDI_IN, p::BLOCK, 8, true) };
-    let _audio_in =
-        unsafe { iso::BulkInStream::start(dev.raw_handle(), p::EP_PCM_IN, 5120, 8, false) };
+    let _audio_in = unsafe {
+        iso::BulkInStream::start(dev.raw_handle(), p::EP_PCM_IN, p::AUDIO_IN_XFER, 8, false)
+    };
     match (&_midi_in, &_audio_in) {
         (Ok(_), Ok(_)) => println!("bulk in  : queues up on 0x83 and 0x86"),
         _ => println!(

@@ -116,24 +116,6 @@ impl Ns6 {
         Ok(buf[0])
     }
 
-    /// Set the sample rate on both PCM endpoints (audio class `SET_CUR`).
-    pub fn set_sample_rate(&self, rate: u32) -> Result<(), Error> {
-        let bytes = p::encode_rate(rate);
-        // The audio endpoints: isochronous out/in plus the bulk audio in.
-        // 0x04 is MIDI, so it gets no sample rate.
-        for ep in [p::EP_ISO_OUT, p::EP_ISO_IN, p::EP_PCM_IN] {
-            self.handle.write_control(
-                p::SET_CUR_TYPE,
-                p::SET_CUR_REQ,
-                p::SET_CUR_VALUE,
-                ep as u16,
-                &bytes,
-                CTRL_TIMEOUT,
-            )?;
-        }
-        Ok(())
-    }
-
     /// Read back the sample rate the device reports for an endpoint (`GET_CUR`).
     ///
     /// The vendor driver does this after setting the rate; a rate that does not
@@ -209,8 +191,31 @@ impl Ns6 {
         }
     }
 
-    /// Perform the full startup sequence.
+    /// Perform the exact startup sequence captured from the Windows driver.
+    ///
+    /// Taken verbatim from a USBPcap trace of ns6_usb.sys bringing the device up
+    /// (frames 1246-1285 of `captures/ns6.pcap`):
+    ///
+    /// ```text
+    /// 'V' read, wLength 16
+    /// 'V' read, wLength 5
+    /// 'I' read status
+    /// GET_CUR rate, wIndex 0
+    /// SET_CUR 44100 -> 0x86, 0x02, 0x86, 0x02, 0x86   (five times, alternating)
+    /// GET_CUR rate, wIndex 0x86
+    /// 'I' read status
+    /// 'I' write status | 0x30      (arm)
+    /// ABORT_PIPE + SYNC_RESET_PIPE_AND_CLEAR_STALL on 0x86
+    /// ```
+    ///
+    /// The repeated alternating SET_CUR is a documented quirk of this chipset
+    /// family, not an accident of the capture.
     pub fn start(&self) -> Result<(), Error> {
+        // Firmware is read twice, at two different lengths.
+        let mut wide = [0u8; 16];
+        let _ =
+            self.handle
+                .read_control(p::VENDOR_IN, p::CMD_FIRMWARE, 0, 0, &mut wide, CTRL_TIMEOUT);
         let fw = self.firmware()?;
         println!(
             "firmware: {}",
@@ -220,8 +225,32 @@ impl Ns6 {
                 .join(" ")
         );
 
-        self.set_sample_rate(p::SAMPLE_RATE)?;
-        println!("sample rate: {} Hz", p::SAMPLE_RATE);
+        let _ = self.status()?;
+
+        // Rate is read with wIndex 0 first, then set five times alternating
+        // between the audio IN and isochronous OUT endpoints.
+        let _ = self.get_sample_rate_at(0);
+        let bytes = p::encode_rate(p::SAMPLE_RATE);
+        for ep in [
+            p::EP_PCM_IN,
+            p::EP_ISO_OUT,
+            p::EP_PCM_IN,
+            p::EP_ISO_OUT,
+            p::EP_PCM_IN,
+        ] {
+            self.handle.write_control(
+                p::SET_CUR_TYPE,
+                p::SET_CUR_REQ,
+                p::SET_CUR_VALUE,
+                ep as u16,
+                &bytes,
+                CTRL_TIMEOUT,
+            )?;
+        }
+        match self.get_sample_rate(p::EP_PCM_IN) {
+            Ok(r) => println!("sample rate: {r} Hz"),
+            Err(e) => println!("sample rate read back failed: {e}"),
+        }
 
         let (before, after) = self.arm()?;
         println!("armed: status 0x{before:02X} -> 0x{after:02X}");
@@ -229,8 +258,18 @@ impl Ns6 {
             eprintln!("warning: arm bit did not stick (status 0x{after:02X})");
         }
 
-        self.clear_halts();
+        // The driver resets only the audio IN pipe at this point.
+        let _ = self.handle.clear_halt(p::EP_PCM_IN);
         Ok(())
+    }
+
+    /// `GET_CUR` with an explicit wIndex, used for the driver's initial
+    /// wIndex-0 read.
+    pub fn get_sample_rate_at(&self, windex: u16) -> Result<u32, Error> {
+        let mut buf = [0u8; 3];
+        self.handle
+            .read_control(0xA2, 0x81, p::SET_CUR_VALUE, windex, &mut buf, CTRL_TIMEOUT)?;
+        Ok(u32::from(buf[0]) | u32::from(buf[1]) << 8 | u32::from(buf[2]) << 16)
     }
 
     /// Write raw MIDI bytes to the controller (LEDs and display feedback).

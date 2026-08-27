@@ -285,6 +285,8 @@ pub static MIDI_IN: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 pub static MIDI_IN_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static BULK_IN_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static BULK_IN_OK: AtomicU64 = AtomicU64::new(0);
+pub static BULK_IN_ERR: AtomicU64 = AtomicU64::new(0);
+pub static LAST_BULK_STATUS: AtomicU64 = AtomicU64::new(0);
 
 /// Endpoint whose payloads should be treated as MIDI (filler stripped).
 static MIDI_IN_EP: AtomicU64 = AtomicU64::new(0);
@@ -294,6 +296,13 @@ extern "system" fn on_bulk_in(xfer: *mut ffi::libusb_transfer) {
         let t = &*xfer;
         if t.status == LIBUSB_TRANSFER_CANCELLED {
             return;
+        }
+        if t.status != LIBUSB_TRANSFER_COMPLETED {
+            // Silently resubmitting on error hides real faults - notably
+            // LIBUSB_ERROR_OVERFLOW when the posted buffer is smaller than the
+            // transfer the device wants to send.
+            BULK_IN_ERR.fetch_add(1, Ordering::Relaxed);
+            LAST_BULK_STATUS.store(t.status as u64, Ordering::Relaxed);
         }
         if t.status == LIBUSB_TRANSFER_COMPLETED && t.actual_length > 0 {
             BULK_IN_OK.fetch_add(1, Ordering::Relaxed);
