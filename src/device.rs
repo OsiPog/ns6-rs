@@ -67,6 +67,16 @@ impl Ns6 {
         let handle = rusb::open_device_with_vid_pid(p::VID, p::PID).ok_or(Error::NotFound)?;
         handle.set_auto_detach_kernel_driver(true).ok();
 
+        // SET_CONFIGURATION is off by default. The Windows driver issues
+        // SELECT_CONFIGURATION during startup, but sending it here made no
+        // difference to streaming and repeating it knocked the device off the
+        // bus entirely, requiring a physical replug. Opt in with NS6_SET_CONFIG.
+        if std::env::var("NS6_SET_CONFIG").is_ok() {
+            if let Err(e) = handle.set_active_configuration(1) {
+                eprintln!("set_configuration(1): {e} (continuing)");
+            }
+        }
+
         // NS6_IFACES lets a single binary try different claim sets while
         // hunting for whatever the device is waiting on.
         let ifaces: Vec<u8> = match std::env::var("NS6_IFACES") {
@@ -78,10 +88,9 @@ impl Ns6 {
         };
         for iface in ifaces {
             handle.claim_interface(iface)?;
-            // Force an alt 0 -> alt 1 transition. Alt 0 is the zero-bandwidth
-            // idle setting; going straight to alt 1 when the device is already
-            // there is a no-op and never restarts its streaming engine.
-            let _ = handle.set_alternate_setting(iface, 0);
+            // Straight to alt 1. The Windows driver selects alternate settings
+            // via URB_FUNCTION_SELECT_CONFIGURATION and never visits alt 0, so
+            // the cycle through it was speculative and made no difference.
             handle.set_alternate_setting(iface, p::ALT_SETTING)?;
         }
 
@@ -90,7 +99,8 @@ impl Ns6 {
 
     /// Read the 15-byte firmware version block (vendor request `'V'`).
     pub fn firmware(&self) -> Result<Vec<u8>, Error> {
-        let mut buf = [0u8; 15];
+        // The driver's second read uses wLength 5, not 15.
+        let mut buf = [0u8; 5];
         let n = self.handle.read_control(
             p::VENDOR_IN,
             p::CMD_FIRMWARE,
@@ -167,7 +177,26 @@ impl Ns6 {
     /// `0x32` and persists across power cycles. It is level-triggered, so
     /// re-arming an already-armed device is a no-op.
     pub fn arm(&self) -> Result<(u8, u8), Error> {
-        let before = self.status()?;
+        let mut before = self.status()?;
+
+        // In the Windows capture the device reads back 0x12 when the driver
+        // arms it, so the write performs a real 0->1 transition on bit 5. The
+        // register survives USB resets, so on a machine that has already run
+        // this driver it reads 0x32 and the write is a no-op. Clear the bit
+        // first so the device sees the same edge the vendor driver produces.
+        if before & p::ARM_BIT != 0 {
+            let cleared = before & !p::ARM_BIT;
+            let wvalue = (cleared as i8) as i16 as u16;
+            self.handle.write_control(
+                p::VENDOR_OUT,
+                p::CMD_STATUS,
+                wvalue,
+                p::REG_STATUS,
+                &[],
+                CTRL_TIMEOUT,
+            )?;
+            before = self.status()?;
+        }
         let wvalue = p::arm_wvalue(before);
         self.handle.write_control(
             p::VENDOR_OUT,
@@ -211,6 +240,26 @@ impl Ns6 {
     /// The repeated alternating SET_CUR is a documented quirk of this chipset
     /// family, not an accident of the capture.
     pub fn start(&self) -> Result<(), Error> {
+        // The Windows driver re-reads descriptors over the wire during startup
+        // even though the host has them cached. Off by default: it is the last
+        // remaining difference from the driver's control traffic, but it made no
+        // difference here. Opt in with NS6_DESCRIPTORS.
+        if std::env::var("NS6_DESCRIPTORS").is_ok() {
+            let mut dev_desc = [0u8; 18];
+            let _ = self
+                .handle
+                .read_control(0x80, 0x06, 0x0100, 0, &mut dev_desc, CTRL_TIMEOUT);
+            let mut cfg = [0u8; 512];
+            for _ in 0..3 {
+                let _ = self
+                    .handle
+                    .read_control(0x80, 0x06, 0x0200, 0, &mut cfg, CTRL_TIMEOUT);
+            }
+            let _ = self
+                .handle
+                .read_control(0x80, 0x06, 0x0100, 0, &mut dev_desc, CTRL_TIMEOUT);
+        }
+
         // Firmware is read twice, at two different lengths.
         let mut wide = [0u8; 16];
         let _ =
@@ -258,8 +307,14 @@ impl Ns6 {
             eprintln!("warning: arm bit did not stick (status 0x{after:02X})");
         }
 
-        // The driver resets only the audio IN pipe at this point.
-        let _ = self.handle.clear_halt(p::EP_PCM_IN);
+        // No CLEAR_FEATURE here. The Windows driver's ABORT_PIPE and
+        // SYNC_RESET_PIPE_AND_CLEAR_STALL are host-side operations that put no
+        // request on the wire - its control traffic contains no bmRequestType
+        // 0x02 at all - so issuing one is a difference from the driver, not a
+        // match to it. Set NS6_CLEAR_HALT=1 to restore the old behaviour.
+        if std::env::var("NS6_CLEAR_HALT").is_ok() {
+            let _ = self.handle.clear_halt(p::EP_PCM_IN);
+        }
         Ok(())
     }
 
