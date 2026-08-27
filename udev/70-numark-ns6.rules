@@ -1,0 +1,4 @@
+# Numark NS6 (original, 15e4:0079) — vendor-specific USB class, no kernel driver
+# binds it, so it must be reached from userspace via libusb. Grant the local
+# desktop user access to the raw USB device node.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="15e4", ATTRS{idProduct}=="0079", TAG+="uaccess", GROUP="wheel", MODE="0660"
