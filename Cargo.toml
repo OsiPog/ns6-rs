@@ -4,10 +4,11 @@ version = "0.1.0"
 edition = "2021"
 description = "Userspace MIDI driver for the Numark NS6 DJ controller on Linux"
 license = "MIT"
-repository = "https://github.com/osi/ns6"
+repository = "https://github.com/OsiPog/ns6-rs"
 readme = "README.md"
 
 [dependencies]
+libc = "0.2"
 rusb = "0.9"
 alsa = "0.9"
 

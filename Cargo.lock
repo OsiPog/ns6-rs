@@ -75,6 +75,7 @@ name = "ns6"
 version = "0.1.0"
 dependencies = [
  "alsa",
+ "libc",
  "rusb",
 ]
 

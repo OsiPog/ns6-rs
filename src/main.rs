@@ -12,6 +12,7 @@ mod ledmap;
 mod learn;
 mod midi;
 mod protocol;
+mod term;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -724,111 +725,122 @@ impl Drop for Streams {
 /// hundred notes will do nothing and prompting for each would be unusable.
 /// Enter interrupts, which is when the typing starts.
 fn cmd_leds() -> Result<(), Box<dyn std::error::Error>> {
+    let (dev, _streams) = open_for_output()?;
+    install_signal_handler();
+
+    let mut walk = ledmap::LedWalk::new(5, &[0xB0, 0x90], 0x80);
+    let (_, total) = walk.position();
+    println!(
+        "\n{total} candidates: control change then note on, channels 1-5.\n\n\
+         The walk does not move on its own - nothing goes past while you are\n\
+         looking at the panel.\n\n    \
+         right arrow   send the next one; hold to skim\n    \
+         left arrow    go back; hold to skim backwards\n    \
+         Enter         describe what is lit; Enter again saves it\n    \
+         q             stop and write ns6-leds.toml\n"
+    );
+
+    let Some(raw) = term::RawMode::enable() else {
+        return Err("ns6 leds needs a terminal: it reads arrow keys".into());
+    };
+
+    let send = |c: ledmap::Candidate, on: bool| -> Result<(), device::Error> {
+        dev.write_midi(&c.message(on)).map(|_| ())
+    };
+
+    // Nothing is sent until the first right arrow, so the panel starts dark.
+    let mut lit: Option<ledmap::Candidate> = None;
+
+    let show = |walk: &ledmap::LedWalk, c: ledmap::Candidate| {
+        let (n, total) = walk.position();
+        let named = walk.description_of(c);
+        print!(
+            "\r\x1b[K  [{n}/{total}] {}{}",
+            c.describe(),
+            named.map(|d| format!("   = {d}")).unwrap_or_default()
+        );
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    };
+
+    // Holding an arrow skims; the dwell is how fast.
     let dwell = Duration::from_millis(
         std::env::var("NS6_LED_DWELL")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(700),
+            .unwrap_or(120),
     );
-    let (dev, _streams) = open_for_output()?;
-    install_signal_handler();
+    let mut last_step = Instant::now() - dwell;
+    let mut quit = false;
 
-    let mut walk = ledmap::LedWalk::new(5, 0x80);
-    println!(
-        "\nWalking every note on channels 1-5, one lit at a time, {} ms each.\n\n\
-         Watch the panel. The moment something lights:\n    \
-         Enter   hold here and send it again, so you can look properly\n    \
-         text    what it lit - recorded, then the walk resumes\n    \
-         -       nothing after all, resume\n    \
-         b       step back one, if you noticed it a moment late\n    \
-         q       stop and write ns6-leds.toml\n",
-        dwell.as_millis()
-    );
+    while running() && !quit {
+        let pending = term::drain();
 
-    let (tx, rx) = mpsc::channel::<String>();
-    thread::spawn(move || {
-        let mut line = String::new();
-        while std::io::stdin().read_line(&mut line).unwrap_or(0) > 0 {
-            if tx.send(line.trim_end().to_string()).is_err() {
-                break;
+        for c in &pending.chars {
+            if *c == 'q' || *c == 'Q' {
+                quit = true;
             }
-            line.clear();
         }
-    });
+        if quit {
+            break;
+        }
 
-    let send = |c: ledmap::Candidate, on: bool| -> Result<(), device::Error> {
-        dev.write_midi(&[0x90 | (c.channel & 0x0F), c.note, if on { 0x7F } else { 0x00 }])
-            .map(|_| ())
-    };
-
-    let mut lit = walk.current();
-    if let Some(c) = lit {
-        send(c, true)?;
-    }
-    let mut since = Instant::now();
-
-    while running() && !walk.done() {
-        if let Ok(line) = rx.try_recv() {
-            let line = line.trim().to_string();
-            let here = walk.current();
-            if line.eq_ignore_ascii_case("q") {
-                break;
-            } else if line.is_empty() {
-                // Hold position and flash it again, so it is unmistakable.
-                walk.paused = true;
-                if let Some(c) = here {
-                    send(c, false)?;
-                    thread::sleep(Duration::from_millis(150));
-                    send(c, true)?;
-                    println!("  holding: {}   (describe it, or - to resume)", c.describe());
-                }
-            } else if line == "-" {
-                walk.paused = false;
-                since = Instant::now();
-            } else if line.eq_ignore_ascii_case("b") {
+        if let Some(arrow) = pending.arrow {
+            if last_step.elapsed() >= dwell {
                 if let Some(c) = lit {
                     send(c, false)?;
                 }
-                let c = walk.back();
-                lit = c;
-                if let Some(c) = c {
-                    send(c, true)?;
-                    println!("  back to: {}", c.describe());
+                let next = if arrow == term::Key::Right {
+                    walk.advance()
+                } else {
+                    walk.back()
+                };
+                match next {
+                    Some(c) => {
+                        send(c, true)?;
+                        lit = Some(c);
+                        show(&walk, c);
+                    }
+                    None => {
+                        lit = None;
+                        println!("\n  end of the list. q to finish.");
+                    }
                 }
-                walk.paused = true;
-            } else {
-                walk.record(&line);
-                let (n, total) = walk.position();
-                println!(
-                    "  recorded [{n}/{total}] {} = {line}",
-                    here.map(|c| c.describe()).unwrap_or_default()
-                );
-                walk.paused = false;
-                since = Instant::now();
+                last_step = Instant::now();
             }
         }
 
-        if !walk.paused && since.elapsed() >= dwell {
-            if let Some(c) = lit {
-                send(c, false)?;
-            }
-            let next = walk.advance();
-            lit = next;
-            if let Some(c) = next {
-                send(c, true)?;
-                let (n, total) = walk.position();
-                print!("\r  [{n}/{total}] {}          ", c.describe());
+        if pending.enter {
+            if let Some(c) = walk.current() {
+                let cooked = raw.cooked();
+                println!("\n  {}", c.describe());
+                print!("  what is lit? ");
                 let _ = std::io::Write::flush(&mut std::io::stdout());
+                let mut line = String::new();
+                if std::io::stdin().read_line(&mut line).unwrap_or(0) > 0 {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        println!("  (nothing recorded)");
+                    } else {
+                        walk.record(line);
+                        println!("  recorded: {line}");
+                    }
+                }
+                drop(cooked);
+                show(&walk, c);
+                last_step = Instant::now();
             }
-            since = Instant::now();
         }
-        thread::sleep(Duration::from_millis(10));
+
+        thread::sleep(Duration::from_millis(5));
     }
+    drop(raw);
 
     // Leave nothing lit.
-    for ch in 0..5u8 {
-        for note in 0..0x80u8 {
-            let _ = dev.write_midi(&[0x90 | ch, note, 0x00]);
+    for kind in [0xB0u8, 0x90] {
+        for ch in 0..5u8 {
+            for n in 0..0x80u8 {
+                let _ = dev.write_midi(&[kind | ch, n, 0x00]);
+            }
         }
     }
 
