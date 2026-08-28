@@ -181,3 +181,159 @@ fn shape(c: &Control) -> &'static str {
         }
     }
 }
+
+/// A control's identity on the wire: channel, message kind, and number.
+pub type Key = (u8, Kind, u8);
+
+/// Walks the checklist, asking for one control at a time.
+///
+/// A control counts as identified once it has produced enough activity to be
+/// unambiguous - a couple of messages for a button, a handful for a fader - and
+/// has not already been claimed by an earlier answer. Everything the device
+/// announced at startup is claimed up front, so a control that has merely
+/// reported its resting position is never mistaken for one the user moved.
+pub struct Guided {
+    index: usize,
+    claimed: BTreeMap<Key, &'static str>,
+    baseline: std::collections::BTreeSet<Key>,
+    pub answers: Vec<(&'static str, Vec<Key>)>,
+    pending: Vec<Key>,
+    settled: Option<Instant>,
+}
+
+/// Messages needed before a control is taken seriously. Buttons send one event
+/// per press, continuous controls send a stream.
+const BUTTON_EVENTS: u64 = 1;
+const CONTINUOUS_EVENTS: u64 = 6;
+/// How long a control must stay quiet before the answer is accepted, so that a
+/// fader sweep is recorded as one control rather than truncated mid-move.
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(700);
+
+impl Guided {
+    pub fn new(surface: &Surface) -> Self {
+        Self {
+            index: 0,
+            claimed: BTreeMap::new(),
+            baseline: surface.controls.keys().copied().collect(),
+            answers: Vec::new(),
+            pending: Vec::new(),
+            settled: None,
+        }
+    }
+
+    pub fn current(&self) -> Option<&'static crate::checklist::Item> {
+        crate::checklist::ITEMS.get(self.index)
+    }
+
+    pub fn prompt(&self) {
+        match self.current() {
+            Some(item) => println!(
+                "\n[{}/{}] Move: {}",
+                self.index + 1,
+                crate::checklist::ITEMS.len(),
+                item.prompt
+            ),
+            None => println!("\nChecklist finished."),
+        }
+    }
+
+    /// Note activity on a control. Returns true when the current item is done.
+    pub fn observe(&mut self, c: &Control) -> bool {
+        let key = (c.channel, c.kind, c.number);
+        if self.claimed.contains_key(&key) {
+            return false;
+        }
+        let needed = if c.kind == Kind::Note {
+            BUTTON_EVENTS
+        } else {
+            CONTINUOUS_EVENTS
+        };
+        // A control seen at startup has already reported its resting value, so
+        // only count what it has done since.
+        let floor = u64::from(self.baseline.contains(&key));
+        if c.count.saturating_sub(floor) < needed {
+            return false;
+        }
+        if !self.pending.contains(&key) {
+            self.pending.push(key);
+        }
+        self.settled = Some(Instant::now());
+        false
+    }
+
+    /// Call regularly; accepts the answer once the user has stopped moving.
+    pub fn poll(&mut self) -> bool {
+        let Some(at) = self.settled else { return false };
+        if at.elapsed() < SETTLE || self.pending.is_empty() {
+            return false;
+        }
+        self.accept()
+    }
+
+    fn accept(&mut self) -> bool {
+        let Some(item) = self.current() else {
+            return false;
+        };
+        let keys = std::mem::take(&mut self.pending);
+        for k in &keys {
+            self.claimed.insert(*k, item.id);
+        }
+        println!("  -> {} = {}", item.id, describe_keys(&keys));
+        self.answers.push((item.id, keys));
+        self.index += 1;
+        self.settled = None;
+        true
+    }
+
+    /// Move on without recording anything - the control does not exist on this
+    /// unit, or is analogue-only and sends no MIDI.
+    pub fn skip(&mut self) -> bool {
+        if let Some(item) = self.current() {
+            println!("  -> {} skipped", item.id);
+            self.answers.push((item.id, Vec::new()));
+        }
+        self.pending.clear();
+        self.settled = None;
+        self.index += 1;
+        self.index < crate::checklist::ITEMS.len()
+    }
+
+    pub fn done(&self) -> bool {
+        self.index >= crate::checklist::ITEMS.len()
+    }
+
+    /// The whole result, as TOML the mapping generator reads.
+    pub fn to_toml(&self) -> String {
+        let mut s = String::from(
+            "# Numark NS6 control surface, recorded by `ns6 learn --guided`.\n\
+             # Each entry lists the MIDI messages one physical control emits.\n\n",
+        );
+        for (id, keys) in &self.answers {
+            let _ = writeln!(s, "[\"{id}\"]");
+            if keys.is_empty() {
+                let _ = writeln!(s, "messages = []  # sends nothing\n");
+                continue;
+            }
+            let _ = writeln!(s, "messages = [");
+            for (ch, kind, num) in keys {
+                let k = if *kind == Kind::Cc { "cc" } else { "note" };
+                let _ = writeln!(
+                    s,
+                    "  {{ channel = {ch}, kind = \"{k}\", number = {num} }},"
+                );
+            }
+            let _ = writeln!(s, "]\n");
+        }
+        s
+    }
+}
+
+fn describe_keys(keys: &[Key]) -> String {
+    keys.iter()
+        .map(|(ch, kind, n)| {
+            let k = if *kind == Kind::Cc { "CC" } else { "note" };
+            format!("ch{ch} {k}{n}")
+        })
+        .collect::<Vec<_>>()
+        .join(" + ")
+}

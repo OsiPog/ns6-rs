@@ -6,6 +6,7 @@
 //!
 //! See `docs/PROTOCOL.md` for how the protocol was derived.
 
+mod checklist;
 mod device;
 mod iso;
 mod learn;
@@ -29,6 +30,9 @@ fn usage() -> ! {
              ns6 [run]     bridge the controller to an ALSA MIDI port (default)\n    \
              ns6 probe     report device state and sweep bulk OUT configurations\n    \
              ns6 learn     name the control surface: move one control at a time\n    \
+             ns6 learn --guided\n                  \
+                           walk the NS6's panel, one prompt at a time, and write\n                  \
+                           the result to ns6-surface.toml\n    \
              ns6 test      emit synthetic MIDI on the ALSA port, no hardware needed\n\
          \n\
          The device's usbfs node must be writable; see udev/70-numark-ns6.rules."
@@ -39,8 +43,11 @@ fn usage() -> ! {
 fn main() {
     let arg = std::env::args().nth(1).unwrap_or_else(|| "run".into());
     let result = match arg.as_str() {
-        "run" => cmd_run(false),
-        "learn" => cmd_run(true),
+        "run" => cmd_run(Mode::Bridge),
+        "learn" => cmd_run(match std::env::args().nth(2).as_deref() {
+            Some("--guided") | Some("-g") => Mode::Guided,
+            _ => Mode::Learn,
+        }),
         "probe" => cmd_probe(),
         "test" => cmd_test(),
         "-h" | "--help" | "help" => usage(),
@@ -111,12 +118,20 @@ impl Geometry {
     }
 }
 
+/// What to do with the MIDI the device sends, on top of bridging it to ALSA.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Just bridge.
+    Bridge,
+    /// Also decode and report every control as it moves.
+    Learn,
+    /// Also walk the panel checklist and write out a surface map.
+    Guided,
+}
+
 /// Bring the device up and bridge it to ALSA.
-///
-/// With `learn` set, the MIDI stream is also decoded into a control-surface
-/// table and reported as it fills in, which is how the Mixxx mapping's note and
-/// CC numbers were established.
-fn cmd_run(learn: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_run(mode: Mode) -> Result<(), Box<dyn std::error::Error>> {
+    let learn = mode != Mode::Bridge;
     let mut port = midi::MidiPort::open()?;
     port.describe();
 
@@ -220,15 +235,53 @@ fn cmd_run(learn: bool) -> Result<(), Box<dyn std::error::Error>> {
     let mut last_beat = Instant::now();
     let mut warned = false;
     let mut surface = learn::Surface::new();
-    let mut last_named: Option<(u8, learn::Kind, u8)> = None;
+    let mut last_named: Option<learn::Key> = None;
     let mut quiet_since = Instant::now();
+    let mut guided: Option<learn::Guided> = None;
+    // Typed lines, read off a thread so the stream is never blocked on stdin.
+    let (key_tx, key_rx) = mpsc::channel::<String>();
 
-    if learn {
+    if mode == Mode::Learn {
         println!(
             "learn mode: move ONE control, then wait a moment. Everything the device\n\
              announces at startup is listed first; after that each line is a control\n\
              you just moved. Ctrl-C prints the full table.\n"
         );
+    }
+    if mode == Mode::Guided {
+        // The device announces every control's resting position the moment it
+        // starts, and that burst must be absorbed before prompting - otherwise
+        // the first answer is whatever happened to arrive last.
+        println!("waiting for the device to finish announcing its state...");
+        let settle = Instant::now();
+        while running() && settle.elapsed() < Duration::from_secs(3) {
+            if let Ok(mut q) = iso::MIDI_IN.lock() {
+                if !q.is_empty() {
+                    surface.feed(&q);
+                    q.clear();
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        println!(
+            "{}\n\n\
+             Walking the panel. Move each control as asked and it will be recorded\n\
+             automatically. Press Enter to skip one that does not exist or is\n\
+             analogue-only, or type q then Enter to stop and write what you have.",
+            surface.report().lines().next().unwrap_or("nothing announced")
+        );
+        let g = learn::Guided::new(&surface);
+        g.prompt();
+        guided = Some(g);
+        thread::spawn(move || {
+            let mut line = String::new();
+            while std::io::stdin().read_line(&mut line).unwrap_or(0) > 0 {
+                if key_tx.send(line.trim().to_string()).is_err() {
+                    break;
+                }
+                line.clear();
+            }
+        });
     }
 
     while running() {
@@ -237,6 +290,10 @@ fn cmd_run(learn: bool) -> Result<(), Box<dyn std::error::Error>> {
             if !q.is_empty() {
                 if learn {
                     for c in surface.feed(&q) {
+                        if let Some(g) = guided.as_mut() {
+                            g.observe(&c);
+                            continue;
+                        }
                         let key = (c.channel, c.kind, c.number);
                         // One line per control per burst, not per message.
                         if last_named != Some(key) || quiet_since.elapsed() > Duration::from_millis(400) {
@@ -270,9 +327,26 @@ fn cmd_run(learn: bool) -> Result<(), Box<dyn std::error::Error>> {
             let _ = midi_tx.send(byte);
         }
 
+        if let Some(g) = guided.as_mut() {
+            if g.poll() {
+                g.prompt();
+            }
+            match key_rx.try_recv() {
+                Ok(line) if line.eq_ignore_ascii_case("q") => break,
+                Ok(_) => {
+                    g.skip();
+                    g.prompt();
+                }
+                Err(_) => {}
+            }
+            if g.done() {
+                break;
+            }
+        }
+
         thread::sleep(Duration::from_millis(2));
 
-        if last_beat.elapsed() >= Duration::from_secs(5) {
+        if guided.is_none() && last_beat.elapsed() >= Duration::from_secs(5) {
             last_beat = Instant::now();
             let ok = stats.out_ok.load(Ordering::Relaxed);
             let err = stats.out_err.load(Ordering::Relaxed);
@@ -298,6 +372,13 @@ fn cmd_run(learn: bool) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    if let Some(g) = guided.as_ref() {
+        let path = std::path::Path::new("ns6-surface.toml");
+        match std::fs::write(path, g.to_toml()) {
+            Ok(()) => println!("\nwrote {} controls to {}", g.answers.len(), path.display()),
+            Err(e) => eprintln!("\ncould not write {}: {e}", path.display()),
+        }
+    }
     if learn {
         println!("\n{}", surface.report());
         let pairs = surface.fourteen_bit_pairs();
