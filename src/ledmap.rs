@@ -156,3 +156,56 @@ impl LedWalk {
             .map(|f| f.description.as_str())
     }
 }
+
+impl LedWalk {
+    /// Jump to a position, for resuming a walk the device did not survive.
+    pub fn seek(&mut self, index: usize) {
+        self.index = index.min(self.candidates.len().saturating_sub(1));
+        self.started = true;
+    }
+
+    /// Re-read a map written by an earlier run, so a resumed walk keeps what it
+    /// already found. Unparseable or missing files are simply ignored.
+    pub fn load(&mut self, path: &std::path::Path) {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let (mut description, mut channel, mut kind, mut number) =
+            (None, None, None, None::<u8>);
+        for line in text.lines() {
+            let line = line.trim();
+            let value = |l: &str| l.split('=').nth(1).map(|v| v.trim().to_string());
+            if line.starts_with("description") {
+                description = value(line).map(|v| v.trim_matches('"').to_string());
+            } else if line.starts_with("channel") {
+                channel = value(line).and_then(|v| v.parse::<u8>().ok());
+            } else if line.starts_with("kind") {
+                kind = value(line).map(|v| {
+                    if v.contains("cc") {
+                        0xB0u8
+                    } else {
+                        0x90
+                    }
+                });
+            } else if line.starts_with("number") {
+                number = value(line)
+                    .and_then(|v| v.split('#').next().map(str::trim).and_then(|n| n.parse().ok()));
+            }
+            if let (Some(d), Some(c), Some(k), Some(n)) =
+                (&description, channel, kind, number)
+            {
+                self.found.push(Found {
+                    channel: c,
+                    kind: k,
+                    number: n,
+                    description: d.clone(),
+                });
+                description = None;
+                number = None;
+            }
+        }
+        if !self.found.is_empty() {
+            println!("carried over {} already-described LEDs", self.found.len());
+        }
+    }
+}

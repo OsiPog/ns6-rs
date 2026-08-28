@@ -724,11 +724,24 @@ impl Drop for Streams {
 /// Runs on its own with one LED lit at a time, because most of the several
 /// hundred notes will do nothing and prompting for each would be unusable.
 /// Enter interrupts, which is when the typing starts.
+/// Where the LED map is read back from and written to.
+const LED_MAP: &str = "ns6-leds.toml";
+
 fn cmd_leds() -> Result<(), Box<dyn std::error::Error>> {
     let (dev, _streams) = open_for_output()?;
     install_signal_handler();
 
     let mut walk = ledmap::LedWalk::new(5, &[0xB0, 0x90], 0x80);
+    // The device can be knocked off the bus by this sweep - the MIDI OUT byte
+    // stream doubles as a serial register interface into an audio chip - so the
+    // walk has to be resumable and has to keep what has been found so far.
+    if let Ok(start) = std::env::var("NS6_LED_START") {
+        if let Ok(n) = start.parse::<usize>() {
+            walk.seek(n.saturating_sub(1));
+            println!("resuming at {n}");
+        }
+    }
+    walk.load(std::path::Path::new(LED_MAP));
     let (_, total) = walk.position();
     println!(
         "\n{total} candidates: control change then note on, channels 1-5.\n\n\
@@ -796,7 +809,17 @@ fn cmd_leds() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 match next {
                     Some(c) => {
-                        send(c, true)?;
+                        if let Err(e) = send(c, true) {
+                            let (n, _) = walk.position();
+                            println!(
+                                "\n\n  the device stopped responding at [{n}] {}\n  \
+                                 ({e})\n\n  Power-cycle it, then carry on with:\n      \
+                                 NS6_LED_START={} ns6 leds",
+                                c.describe(),
+                                n + 1
+                            );
+                            break;
+                        }
                         lit = Some(c);
                         show(&walk, c);
                     }
@@ -822,6 +845,11 @@ fn cmd_leds() -> Result<(), Box<dyn std::error::Error>> {
                         println!("  (nothing recorded)");
                     } else {
                         walk.record(line);
+                        // Written now rather than at exit: this sweep can take
+                        // the device down without warning.
+                        if let Err(e) = std::fs::write(LED_MAP, walk.to_toml()) {
+                            eprintln!("  could not save: {e}");
+                        }
                         println!("  recorded: {line}");
                     }
                 }
@@ -844,7 +872,7 @@ fn cmd_leds() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let path = std::path::Path::new("ns6-leds.toml");
+    let path = std::path::Path::new(LED_MAP);
     match std::fs::write(path, walk.to_toml()) {
         Ok(()) => println!("\n\nwrote {} LEDs to {}", walk.found.len(), path.display()),
         Err(e) => eprintln!("\ncould not write {}: {e}", path.display()),

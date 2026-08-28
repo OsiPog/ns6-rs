@@ -59,6 +59,27 @@ ns6 test &
 aseqdump -p "Numark NS6"
 ```
 
+### Mapping the LEDs
+
+`ns6 leds` walks the output space so you can record what each message lights.
+Right steps forward and sends, left steps back, Enter describes what is lit.
+Holding an arrow skims at `NS6_LED_DWELL` per step.
+
+**This can knock the device off the bus.** The MIDI OUT byte stream is not only
+MIDI: the vendor driver bit-bangs a serial register interface into an audio chip
+through the same pipe, using byte patterns `addr | 0x00/0x40/0x80/0xC0/0xE0` as
+clock and data. Sweeping arbitrary bytes therefore clocks arbitrary bits into
+that chip. A power cycle recovers it.
+
+So the walk saves after every description and can be resumed:
+
+```sh
+NS6_LED_START=58 ns6 leds
+```
+
+which picks up where it stopped and carries over everything already in
+`ns6-leds.toml`.
+
 ### Mapping the control surface
 
 `ns6 map` records the panel the way you actually think about it: move
