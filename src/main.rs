@@ -8,6 +8,7 @@
 
 mod device;
 mod iso;
+mod learn;
 mod midi;
 mod protocol;
 
@@ -27,6 +28,7 @@ fn usage() -> ! {
          USAGE:\n    \
              ns6 [run]     bridge the controller to an ALSA MIDI port (default)\n    \
              ns6 probe     report device state and sweep bulk OUT configurations\n    \
+             ns6 learn     name the control surface: move one control at a time\n    \
              ns6 test      emit synthetic MIDI on the ALSA port, no hardware needed\n\
          \n\
          The device's usbfs node must be writable; see udev/70-numark-ns6.rules."
@@ -37,7 +39,8 @@ fn usage() -> ! {
 fn main() {
     let arg = std::env::args().nth(1).unwrap_or_else(|| "run".into());
     let result = match arg.as_str() {
-        "run" => cmd_run(),
+        "run" => cmd_run(false),
+        "learn" => cmd_run(true),
         "probe" => cmd_probe(),
         "test" => cmd_test(),
         "-h" | "--help" | "help" => usage(),
@@ -108,7 +111,12 @@ impl Geometry {
     }
 }
 
-fn cmd_run() -> Result<(), Box<dyn std::error::Error>> {
+/// Bring the device up and bridge it to ALSA.
+///
+/// With `learn` set, the MIDI stream is also decoded into a control-surface
+/// table and reported as it fills in, which is how the Mixxx mapping's note and
+/// CC numbers were established.
+fn cmd_run(learn: bool) -> Result<(), Box<dyn std::error::Error>> {
     let mut port = midi::MidiPort::open()?;
     port.describe();
 
@@ -211,11 +219,45 @@ fn cmd_run() -> Result<(), Box<dyn std::error::Error>> {
     let mut feedback = Vec::new();
     let mut last_beat = Instant::now();
     let mut warned = false;
+    let mut surface = learn::Surface::new();
+    let mut last_named: Option<(u8, learn::Kind, u8)> = None;
+    let mut quiet_since = Instant::now();
+
+    if learn {
+        println!(
+            "learn mode: move ONE control, then wait a moment. Everything the device\n\
+             announces at startup is listed first; after that each line is a control\n\
+             you just moved. Ctrl-C prints the full table.\n"
+        );
+    }
 
     while running() {
         // Surface events from the device -> ALSA.
         if let Ok(mut q) = iso::MIDI_IN.lock() {
             if !q.is_empty() {
+                if learn {
+                    for c in surface.feed(&q) {
+                        let key = (c.channel, c.kind, c.number);
+                        // One line per control per burst, not per message.
+                        if last_named != Some(key) || quiet_since.elapsed() > Duration::from_millis(400) {
+                            last_named = Some(key);
+                            quiet_since = Instant::now();
+                            println!(
+                                "  ch{} {} {:>3} (0x{:02X})  value {:>3}  range {}..{}  x{}",
+                                c.channel,
+                                if c.kind == learn::Kind::Cc { "CC" } else { "note" },
+                                c.number,
+                                c.number,
+                                c.last,
+                                c.min,
+                                c.max,
+                                c.count
+                            );
+                        } else {
+                            quiet_since = Instant::now();
+                        }
+                    }
+                }
                 port.send_bytes(&q);
                 q.clear();
             }
@@ -252,6 +294,17 @@ fn cmd_run() -> Result<(), Box<dyn std::error::Error>> {
                      streaming and will not report its surface. Run `ns6 probe` to sweep\n  \
                      transfer sizes and framings."
                 );
+            }
+        }
+    }
+
+    if learn {
+        println!("\n{}", surface.report());
+        let pairs = surface.fourteen_bit_pairs();
+        if !pairs.is_empty() {
+            println!("14-bit pairs (MSB at n, LSB at n+32):");
+            for (ch, n) in pairs {
+                println!("  ch{ch} CC{n} + CC{}", n + 32);
             }
         }
     }
