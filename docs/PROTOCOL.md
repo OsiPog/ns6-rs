@@ -154,21 +154,50 @@ where type `0x40` = vendor and `0x20` = class; the recipient maps to URB functio
 Note `wIndex 0x0005` (used by the Xone) does not exist on the NS6; the rate goes to
 `0x86` and `0x04`.
 
-## Arming
+## Starting the device
 
-Read `'I'` register 0, then write it back with bit 5 set, sign-extended through
-`int8` — the driver's cast is `(short)(char)`, so a status byte with bit 7 set must
-produce `0xFFxx`:
+Read `'I'` register 0, then write the register back with the **whole value in
+`wValue`**, sign-extended through `int8` — the driver's cast is `(short)(char)`,
+so a byte with bit 7 set has to produce `0xFFxx`:
 
 ```rust
-pub fn arm_wvalue(status: u8) -> u16 {
-    ((status | 0x20) as i8) as i16 as u16
+pub fn status_wvalue(value: u8) -> u16 {
+    (value as i8) as i16 as u16
 }
 ```
 
-On this unit register 0 goes `0x12` → `0x32` and **persists across power cycles**.
-It is level-triggered: cycling it `0x32` → `0x12` → `0x32` while streaming produces
-nothing.
+The value is what matters, and it is not a single "arm" bit.
+`PGDevice::vendorSelectBitDepth` builds the byte from three independent fields:
+
+| Bit | Meaning |
+|---|---|
+| `0x10` | Streaming enable. Set unconditionally. |
+| `0x20` | Selects the **16-bit** sample container. |
+| `0x02` | Analogue input selector, maintained by `updateAjInputSelector`. |
+
+This unit reads `0x12` at power-up. The Windows driver writes back `0x32`
+(`0x12 | 0x20`), and copying that value verbatim is what kept this driver from
+ever working. Writing **`0x10`** starts it.
+
+Both of the other bits have to be clear. Swept against the hardware, from a
+power cycle each time:
+
+| Written | Result |
+|---|---|
+| `0x10` | streams: audio on `0x86`, feedback on `0x81`, MIDI on `0x83` |
+| `0x12` | mute |
+| `0x32` (what Windows writes) | mute |
+| `0x33` | mute |
+| `0x3a` | mute |
+
+Clearing `0x20` is the part that matters: it selects the 24-bit container, which
+is what the 12-byte, 4-channel output frame described above actually carries. Ask
+for 16-bit and the device accepts the whole init, answers exactly one 3-byte
+feedback packet, and then goes silent for good — which is a remarkably good
+imitation of a device that is simply ignoring you.
+
+Register 0 **persists across power cycles**, and the write is level-triggered:
+there is no need to cycle the enable bit to produce an edge.
 
 ## There is no "enable MIDI" command
 
@@ -181,7 +210,31 @@ When a MIDI client opens the port, `ns6_midi.sys` sends
 table of function pointers. That exchange is **entirely internal** — no USB traffic.
 
 So MIDI is not unlocked by a command. It is a consequence of the device streaming,
-which is why the driver's continuously-running stream makes it work on Windows.
+and the device streams when the status register says so.
+
+## Stream geometry
+
+Taken from `captures/ns6.pcap`, a capture of the vendor driver on real Windows
+while MIDI was flowing. Within 600 µs of the last control transfer it posts:
+
+| Pipe | Depth | Size |
+|---|---|---|
+| bulk IN `0x86` (audio in) | 7 | 131072 bytes each |
+| iso IN `0x81` (feedback) | 9 | 5 packets of 3 bytes |
+| iso OUT `0x02` (audio out) | 3 | 40 packets, ~2646 bytes total |
+| bulk IN `0x83` (MIDI in) | 5 | 42 bytes each |
+
+in that order, and the device starts streaming about 7 ms later.
+
+Isochronous URBs never set `USBD_START_ISO_TRANSFER_ASAP`; every one carries an
+explicit absolute start frame, chosen as `current + 4` and advanced per
+submission.
+
+The iso OUT packet lengths alternate 72 and 60 bytes — 6 and 5 audio frames of
+12 bytes — with an extra 72 roughly every 40 packets. That averages 5.5125
+frames per microframe, which is 44100/8000. The feedback endpoint answers with
+one byte per millisecond, `0x2c` or `0x2d`: 44 or 45 frames, the same rate seen
+from the other side.
 
 ## Gotchas
 
@@ -201,3 +254,12 @@ an audio client.
 
 **USBPcap** needs a reboot after installation before its filter devices exist, and
 `-A` to capture a device that is not plugged in yet.
+
+**Check that a "working" reference capture actually worked.** The usbmon capture
+taken through the Windows VM (`captures/windows.usbmon`) looks like a reference
+trace and is not one: in it endpoint `0x83` was submitted and cancelled 292 times
+without ever delivering a byte, and only four audio transfers completed. The
+guest's Windows driver was failing in exactly the way ours was, and its init loop
+repeating ~154 times was the symptom, not the recipe. Matching our traffic to it
+was matching a failure. The only capture in this repository that shows the device
+working is `captures/ns6.pcap`, from real hardware.

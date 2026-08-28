@@ -12,20 +12,22 @@ sequencer MIDI port in its place.
 
 ## Status
 
+Working. The controller shows up as an ALSA sequencer port and reports its
+surface.
+
 | Piece | State |
 |---|---|
 | Ploytec chipset identified, protocol documented | done |
-| Vendor handshake (`'V'`, `'I'`, sample rate, arm) | done, verified on hardware |
+| Vendor handshake (`'V'`, `'I'`, sample rate, start) | done, verified on hardware |
 | Endpoint roles and packet framing | done, from driver decompilation |
+| Device streaming: audio in, feedback, MIDI | done, verified on hardware |
 | ALSA MIDI port visible to Mixxx/PortMidi | done, verified with `aseqdump` |
-| Isochronous keep-alive streams | running, verified on hardware |
-| **Device accepting the bulk PCM OUT stream** | **not yet working** |
-| MIDI from the control surface | blocked on the above |
-| Mixxx mapping | not written — needs a real control capture first |
+| Control surface enumerated (`ns6 learn`) | done |
+| Mixxx mapping | in progress |
 
-The device currently refuses (NAKs) every bulk OUT transfer, so it never enters its
-streaming state and never reports its surface. `ns6 probe` exists to attack exactly
-that. See [docs/PROTOCOL.md](docs/PROTOCOL.md) for what is known and how.
+The one thing that had to be got right was the value written to the vendor
+status register: `0x10`, not the `0x32` the Windows driver writes. See
+[Starting the device](docs/PROTOCOL.md#starting-the-device).
 
 ## Building
 
@@ -33,7 +35,7 @@ With Nix (flake):
 
 ```sh
 nix build              # produces ./result/bin/ns6
-nix run . -- probe     # or run directly
+nix run .              # or run directly
 nix develop            # dev shell with cargo, clippy, alsa-utils, usbutils
 ```
 
@@ -44,6 +46,7 @@ Without Nix, you need `libusb-1.0` and `alsa-lib` development packages, then
 
 ```sh
 ns6            # bridge the controller to an ALSA MIDI port (default)
+ns6 learn      # name the control surface: move one control at a time
 ns6 probe      # report device state and sweep bulk OUT configurations
 ns6 test       # emit synthetic MIDI on the ALSA port, no hardware needed
 ```
@@ -116,3 +119,21 @@ The protocol description was obtained by decompiling Numark's Windows driver for
 purpose of interoperability — making hardware I own work with the operating system I
 use. No vendor code is included or derived from; this is a clean implementation
 against a documented wire protocol.
+
+## Working on the hardware
+
+`tools/powercycle.sh` cuts and restores the controller's mains power through a
+Zigbee smart plug, and `tools/trial.sh` wraps a power cycle, a timed run and a
+usbmon capture into one line that reports whether the device actually streamed:
+
+```sh
+tools/trial.sh 10 baseline
+NS6_ARM=0x32 tools/trial.sh 10 windows-value
+```
+
+That pair is what found the register value: every plausible variation could be
+tried from a known-cold device without anyone reaching for a cable. The
+environment variables it passes through (`NS6_ARM`, `NS6_ISO_OUT_PACKETS`,
+`NS6_PCM_IN_DEPTH`, `NS6_ALT_ORDER`, …) exist for exactly that.
+
+The plug is specific to this setup; edit the topic in `tools/powercycle.sh`.
