@@ -16,12 +16,20 @@ const CTRL_TIMEOUT: Duration = Duration::from_millis(2000);
 #[derive(Debug)]
 pub enum Error {
     NotFound,
+    /// Another process has the interfaces claimed.
+    InUse,
     Usb(rusb::Error),
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Error::InUse => write!(
+                f,
+                "the Numark NS6 is already claimed by another process.\n\
+                 If the packaged service is running, stop it first:\n    \
+                 systemctl stop ns6"
+            ),
             Error::NotFound => write!(
                 f,
                 "Numark NS6 ({:04x}:{:04x}) not found, or the usbfs node is not accessible.\n\
@@ -118,7 +126,15 @@ impl Ns6 {
             // Claiming is host-side and emits nothing on the wire, so it can
             // happen here while the visible SET_INTERFACE waits until after the
             // firmware reads - which is the order the Windows driver uses.
-            handle.claim_interface(iface)?;
+            if let Err(e) = handle.claim_interface(iface) {
+                // Almost always the packaged service already holding the
+                // device, which is worth saying rather than leaving the caller
+                // with a bare "Resource busy".
+                if e == rusb::Error::Busy {
+                    return Err(Error::InUse);
+                }
+                return Err(e.into());
+            }
         }
 
         Ok(Self { handle })

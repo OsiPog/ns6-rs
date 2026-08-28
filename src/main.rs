@@ -6,7 +6,6 @@
 //!
 //! See `docs/PROTOCOL.md` for how the protocol was derived.
 
-mod checklist;
 mod device;
 mod iso;
 mod learn;
@@ -29,10 +28,8 @@ fn usage() -> ! {
          USAGE:\n    \
              ns6 [run]     bridge the controller to an ALSA MIDI port (default)\n    \
              ns6 probe     report device state and sweep bulk OUT configurations\n    \
-             ns6 learn     name the control surface: move one control at a time\n    \
-             ns6 learn --guided\n                  \
-                           walk the NS6's panel, one prompt at a time, and write\n                  \
-                           the result to ns6-surface.toml\n    \
+             ns6 learn     watch the control surface: move a control, see its MIDI\n    \
+             ns6 map       move a control, say what it was; writes ns6-surface.toml\n    \
              ns6 test      emit synthetic MIDI on the ALSA port, no hardware needed\n\
          \n\
          The device's usbfs node must be writable; see udev/70-numark-ns6.rules."
@@ -44,10 +41,8 @@ fn main() {
     let arg = std::env::args().nth(1).unwrap_or_else(|| "run".into());
     let result = match arg.as_str() {
         "run" => cmd_run(Mode::Bridge),
-        "learn" => cmd_run(match std::env::args().nth(2).as_deref() {
-            Some("--guided") | Some("-g") => Mode::Guided,
-            _ => Mode::Learn,
-        }),
+        "learn" => cmd_run(Mode::Learn),
+        "map" => cmd_run(Mode::Map),
         "probe" => cmd_probe(),
         "test" => cmd_test(),
         "-h" | "--help" | "help" => usage(),
@@ -125,8 +120,8 @@ enum Mode {
     Bridge,
     /// Also decode and report every control as it moves.
     Learn,
-    /// Also walk the panel checklist and write out a surface map.
-    Guided,
+    /// Also record each control as it is moved and ask what it was.
+    Map,
 }
 
 /// Bring the device up and bridge it to ALSA.
@@ -237,7 +232,7 @@ fn cmd_run(mode: Mode) -> Result<(), Box<dyn std::error::Error>> {
     let mut surface = learn::Surface::new();
     let mut last_named: Option<learn::Key> = None;
     let mut quiet_since = Instant::now();
-    let mut guided: Option<learn::Guided> = None;
+    let mut recorder: Option<learn::Recorder> = None;
     // Typed lines, read off a thread so the stream is never blocked on stdin.
     let (key_tx, key_rx) = mpsc::channel::<String>();
 
@@ -248,13 +243,15 @@ fn cmd_run(mode: Mode) -> Result<(), Box<dyn std::error::Error>> {
              you just moved. Ctrl-C prints the full table.\n"
         );
     }
-    if mode == Mode::Guided {
-        // The device announces every control's resting position the moment it
-        // starts, and that burst must be absorbed before prompting - otherwise
-        // the first answer is whatever happened to arrive last.
-        println!("waiting for the device to finish announcing its state...");
+    if mode == Mode::Map {
+        // Two things have to be absorbed before recording. The device announces
+        // every control's resting position when it starts streaming - though
+        // only once per power-on, so whoever streamed first may already have
+        // taken it - and the platter sensors chatter continuously. Watching a
+        // few seconds of an untouched panel covers both.
+        println!("calibrating - don't touch anything for a moment...");
         let settle = Instant::now();
-        while running() && settle.elapsed() < Duration::from_secs(3) {
+        while running() && settle.elapsed() < Duration::from_secs(4) {
             if let Ok(mut q) = iso::MIDI_IN.lock() {
                 if !q.is_empty() {
                     surface.feed(&q);
@@ -263,20 +260,20 @@ fn cmd_run(mode: Mode) -> Result<(), Box<dyn std::error::Error>> {
             }
             thread::sleep(Duration::from_millis(20));
         }
+        let seen = surface.report();
         println!(
             "{}\n\n\
-             Walking the panel. Move each control as asked and it will be recorded\n\
-             automatically. Press Enter to skip one that does not exist or is\n\
-             analogue-only, or type q then Enter to stop and write what you have.",
-            surface.report().lines().next().unwrap_or("nothing announced")
+             Move a control, then tell me what it was. Repeat for as many as you\n\
+             like; Enter alone throws a reading away so you can try again, and\n\
+             `q` finishes and writes ns6-surface.toml.\n\n\
+             Ready - move something.",
+            seen.lines().next().unwrap_or("0 controls seen")
         );
-        let g = learn::Guided::new(&surface);
-        g.prompt();
-        guided = Some(g);
+        recorder = Some(learn::Recorder::new(&surface));
         thread::spawn(move || {
             let mut line = String::new();
             while std::io::stdin().read_line(&mut line).unwrap_or(0) > 0 {
-                if key_tx.send(line.trim().to_string()).is_err() {
+                if key_tx.send(line.trim_end().to_string()).is_err() {
                     break;
                 }
                 line.clear();
@@ -290,8 +287,8 @@ fn cmd_run(mode: Mode) -> Result<(), Box<dyn std::error::Error>> {
             if !q.is_empty() {
                 if learn {
                     for c in surface.feed(&q) {
-                        if let Some(g) = guided.as_mut() {
-                            g.observe(&c);
+                        if let Some(r) = recorder.as_mut() {
+                            r.observe(&c);
                             continue;
                         }
                         let key = (c.channel, c.kind, c.number);
@@ -327,26 +324,35 @@ fn cmd_run(mode: Mode) -> Result<(), Box<dyn std::error::Error>> {
             let _ = midi_tx.send(byte);
         }
 
-        if let Some(g) = guided.as_mut() {
-            if g.poll() {
-                g.prompt();
+        if let Some(r) = recorder.as_mut() {
+            if let Some(summary) = r.poll() {
+                println!("\n  got:\n{summary}");
+                print!("  what was that? ");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
             }
             match key_rx.try_recv() {
                 Ok(line) if line.eq_ignore_ascii_case("q") => break,
-                Ok(_) => {
-                    g.skip();
-                    g.prompt();
+                Ok(line) if !r.naming => {
+                    // Typed before anything was moved; just re-prompt.
+                    if !line.is_empty() {
+                        println!("  (move a control first)");
+                    }
+                }
+                Ok(line) if line.trim().is_empty() => {
+                    r.discard();
+                    println!("  discarded - move it again.");
+                }
+                Ok(line) => {
+                    r.name(line.trim());
+                    println!("  recorded #{}: {}\n", r.entries.len(), line.trim());
                 }
                 Err(_) => {}
-            }
-            if g.done() {
-                break;
             }
         }
 
         thread::sleep(Duration::from_millis(2));
 
-        if guided.is_none() && last_beat.elapsed() >= Duration::from_secs(5) {
+        if recorder.is_none() && last_beat.elapsed() >= Duration::from_secs(5) {
             last_beat = Instant::now();
             let ok = stats.out_ok.load(Ordering::Relaxed);
             let err = stats.out_err.load(Ordering::Relaxed);
@@ -372,10 +378,10 @@ fn cmd_run(mode: Mode) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if let Some(g) = guided.as_ref() {
+    if let Some(r) = recorder.as_ref() {
         let path = std::path::Path::new("ns6-surface.toml");
-        match std::fs::write(path, g.to_toml()) {
-            Ok(()) => println!("\nwrote {} controls to {}", g.answers.len(), path.display()),
+        match std::fs::write(path, r.to_toml()) {
+            Ok(()) => println!("\nwrote {} controls to {}", r.entries.len(), path.display()),
             Err(e) => eprintln!("\ncould not write {}: {e}", path.display()),
         }
     }

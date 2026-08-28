@@ -185,155 +185,206 @@ fn shape(c: &Control) -> &'static str {
 /// A control's identity on the wire: channel, message kind, and number.
 pub type Key = (u8, Kind, u8);
 
-/// Walks the checklist, asking for one control at a time.
+/// Records the surface the other way round from a checklist: you move a
+/// control, it shows what arrived, and you say what it was.
 ///
-/// A control counts as identified once it has produced enough activity to be
-/// unambiguous - a couple of messages for a button, a handful for a fader - and
-/// has not already been claimed by an earlier answer. Everything the device
-/// announced at startup is claimed up front, so a control that has merely
-/// reported its resting position is never mistaken for one the user moved.
-pub struct Guided {
-    index: usize,
-    claimed: BTreeMap<Key, &'static str>,
-    baseline: std::collections::BTreeSet<Key>,
-    pub answers: Vec<(&'static str, Vec<Key>)>,
-    pending: Vec<Key>,
+/// Two things keep the batches clean. Everything the device announces at
+/// startup is claimed as a baseline, so a control that has only reported its
+/// resting position is never mistaken for one you moved. And anything that
+/// chatters while nothing is being touched - the platter sensors do - is marked
+/// noisy and kept out of a batch unless it is the thing that dominated it.
+pub struct Recorder {
+    claimed: BTreeMap<Key, usize>,
+    baseline: BTreeMap<Key, u64>,
+    noisy: std::collections::BTreeSet<Key>,
+    pending: BTreeMap<Key, Control>,
     settled: Option<Instant>,
+    /// Set while the user is typing a name; incoming messages are ignored so
+    /// that idle chatter cannot join the batch being named.
+    pub naming: bool,
+    pub entries: Vec<Entry>,
 }
 
-/// Messages needed before a control is taken seriously. Buttons send one event
-/// per press, continuous controls send a stream.
-const BUTTON_EVENTS: u64 = 1;
-const CONTINUOUS_EVENTS: u64 = 6;
-/// How long a control must stay quiet before the answer is accepted, so that a
-/// fader sweep is recorded as one control rather than truncated mid-move.
-const SETTLE: std::time::Duration = std::time::Duration::from_millis(700);
+/// One named physical control and the messages it emits.
+pub struct Entry {
+    pub description: String,
+    pub keys: Vec<Key>,
+    /// What the control looked like when it was recorded, for the report.
+    pub notes: Vec<String>,
+}
 
-impl Guided {
+/// Messages a control must produce before it is taken seriously.
+const BUTTON_EVENTS: u64 = 1;
+const CONTINUOUS_EVENTS: u64 = 4;
+/// How long everything must stay quiet before the batch is offered for naming,
+/// so a fader sweep is captured whole rather than cut part way along.
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(600);
+/// A chattering control joins a batch only if it accounts for at least this
+/// fraction of the busiest control's messages.
+const NOISE_FLOOR: u64 = 2;
+
+impl Recorder {
+    /// `surface` must already hold the device's startup announcement.
     pub fn new(surface: &Surface) -> Self {
         Self {
-            index: 0,
             claimed: BTreeMap::new(),
-            baseline: surface.controls.keys().copied().collect(),
-            answers: Vec::new(),
-            pending: Vec::new(),
+            baseline: surface.controls.iter().map(|(k, c)| (*k, c.count)).collect(),
+            // More than a couple of messages before anyone touched anything
+            // means this control talks on its own.
+            noisy: surface
+                .controls
+                .iter()
+                .filter(|(_, c)| c.count > 3)
+                .map(|(k, _)| *k)
+                .collect(),
+            pending: BTreeMap::new(),
             settled: None,
+            naming: false,
+            entries: Vec::new(),
         }
     }
 
-    pub fn current(&self) -> Option<&'static crate::checklist::Item> {
-        crate::checklist::ITEMS.get(self.index)
-    }
-
-    pub fn prompt(&self) {
-        match self.current() {
-            Some(item) => println!(
-                "\n[{}/{}] Move: {}",
-                self.index + 1,
-                crate::checklist::ITEMS.len(),
-                item.prompt
-            ),
-            None => println!("\nChecklist finished."),
+    /// Note activity on a control.
+    pub fn observe(&mut self, c: &Control) {
+        if self.naming {
+            return;
         }
-    }
-
-    /// Note activity on a control. Returns true when the current item is done.
-    pub fn observe(&mut self, c: &Control) -> bool {
         let key = (c.channel, c.kind, c.number);
         if self.claimed.contains_key(&key) {
-            return false;
+            return;
         }
         let needed = if c.kind == Kind::Note {
             BUTTON_EVENTS
         } else {
             CONTINUOUS_EVENTS
         };
-        // A control seen at startup has already reported its resting value, so
-        // only count what it has done since.
-        let floor = u64::from(self.baseline.contains(&key));
-        if c.count.saturating_sub(floor) < needed {
-            return false;
+        // Only count what this control has done since it announced itself.
+        let since = c.count - self.baseline.get(&key).copied().unwrap_or(0).min(c.count);
+        if since < needed {
+            return;
         }
-        if !self.pending.contains(&key) {
-            self.pending.push(key);
-        }
+        self.pending.insert(key, c.clone());
         self.settled = Some(Instant::now());
-        false
     }
 
-    /// Call regularly; accepts the answer once the user has stopped moving.
-    pub fn poll(&mut self) -> bool {
-        let Some(at) = self.settled else { return false };
-        if at.elapsed() < SETTLE || self.pending.is_empty() {
-            return false;
+    /// Call regularly. Returns a description of the batch once movement has
+    /// stopped, at which point the caller should ask for a name.
+    pub fn poll(&mut self) -> Option<String> {
+        if self.naming || self.pending.is_empty() {
+            return None;
         }
-        self.accept()
+        if self.settled?.elapsed() < SETTLE {
+            return None;
+        }
+        self.drop_chatter();
+        if self.pending.is_empty() {
+            self.settled = None;
+            return None;
+        }
+        self.naming = true;
+        Some(self.summary())
     }
 
-    fn accept(&mut self) -> bool {
-        let Some(item) = self.current() else {
-            return false;
-        };
-        let keys = std::mem::take(&mut self.pending);
-        for k in &keys {
-            self.claimed.insert(*k, item.id);
+    /// Remove controls that only chattered alongside whatever was really moved.
+    fn drop_chatter(&mut self) {
+        let loudest = self
+            .pending
+            .values()
+            .map(|c| self.moved(c))
+            .max()
+            .unwrap_or(0);
+        let noisy = self.noisy.clone();
+        let baseline = self.baseline.clone();
+        self.pending.retain(|k, c| {
+            if !noisy.contains(k) {
+                return true;
+            }
+            let moved = c.count - baseline.get(k).copied().unwrap_or(0).min(c.count);
+            moved * NOISE_FLOOR >= loudest
+        });
+    }
+
+    fn moved(&self, c: &Control) -> u64 {
+        let key = (c.channel, c.kind, c.number);
+        c.count - self.baseline.get(&key).copied().unwrap_or(0).min(c.count)
+    }
+
+    fn summary(&self) -> String {
+        let mut lines = Vec::new();
+        for c in self.pending.values() {
+            lines.push(format!(
+                "    ch{} {:<4} {:>3}   value {:>3}   range {}..{}   {} msgs   {}",
+                c.channel,
+                if c.kind == Kind::Cc { "CC" } else { "note" },
+                c.number,
+                c.last,
+                c.min,
+                c.max,
+                self.moved(c),
+                shape(c)
+            ));
         }
-        println!("  -> {} = {}", item.id, describe_keys(&keys));
-        self.answers.push((item.id, keys));
-        self.index += 1;
+        lines.join("\n")
+    }
+
+    /// Accept the batch under `description`.
+    pub fn name(&mut self, description: &str) {
+        let index = self.entries.len();
+        let batch = std::mem::take(&mut self.pending);
+        let mut keys = Vec::new();
+        let mut notes = Vec::new();
+        for (key, c) in batch {
+            self.claimed.insert(key, index);
+            notes.push(format!(
+                "ch{} {} {} ({}..{}, {})",
+                c.channel,
+                if c.kind == Kind::Cc { "CC" } else { "note" },
+                c.number,
+                c.min,
+                c.max,
+                shape(&c)
+            ));
+            keys.push(key);
+        }
+        self.entries.push(Entry {
+            description: description.to_string(),
+            keys,
+            notes,
+        });
         self.settled = None;
-        true
+        self.naming = false;
     }
 
-    /// Move on without recording anything - the control does not exist on this
-    /// unit, or is analogue-only and sends no MIDI.
-    pub fn skip(&mut self) -> bool {
-        if let Some(item) = self.current() {
-            println!("  -> {} skipped", item.id);
-            self.answers.push((item.id, Vec::new()));
-        }
+    /// Throw the batch away without claiming anything, so it can be retried.
+    pub fn discard(&mut self) {
         self.pending.clear();
         self.settled = None;
-        self.index += 1;
-        self.index < crate::checklist::ITEMS.len()
+        self.naming = false;
     }
 
-    pub fn done(&self) -> bool {
-        self.index >= crate::checklist::ITEMS.len()
-    }
-
-    /// The whole result, as TOML the mapping generator reads.
+    /// The recorded surface, as TOML.
     pub fn to_toml(&self) -> String {
         let mut s = String::from(
-            "# Numark NS6 control surface, recorded by `ns6 learn --guided`.\n\
-             # Each entry lists the MIDI messages one physical control emits.\n\n",
+            "# Numark NS6 control surface, recorded with `ns6 map`.\n\
+             # Each entry is one physical control and the MIDI it emits.\n",
         );
-        for (id, keys) in &self.answers {
-            let _ = writeln!(s, "[\"{id}\"]");
-            if keys.is_empty() {
-                let _ = writeln!(s, "messages = []  # sends nothing\n");
-                continue;
-            }
+        for e in &self.entries {
+            let _ = write!(s, "\n[[control]]\ndescription = \"{}\"\n", escape(&e.description));
+            let _ = writeln!(s, "# {}", e.notes.join(", "));
             let _ = writeln!(s, "messages = [");
-            for (ch, kind, num) in keys {
+            for (ch, kind, num) in &e.keys {
                 let k = if *kind == Kind::Cc { "cc" } else { "note" };
                 let _ = writeln!(
                     s,
                     "  {{ channel = {ch}, kind = \"{k}\", number = {num} }},"
                 );
             }
-            let _ = writeln!(s, "]\n");
+            let _ = writeln!(s, "]");
         }
         s
     }
 }
 
-fn describe_keys(keys: &[Key]) -> String {
-    keys.iter()
-        .map(|(ch, kind, n)| {
-            let k = if *kind == Kind::Cc { "CC" } else { "note" };
-            format!("ch{ch} {k}{n}")
-        })
-        .collect::<Vec<_>>()
-        .join(" + ")
+fn escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }

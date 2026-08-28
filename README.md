@@ -46,7 +46,8 @@ Without Nix, you need `libusb-1.0` and `alsa-lib` development packages, then
 
 ```sh
 ns6            # bridge the controller to an ALSA MIDI port (default)
-ns6 learn      # name the control surface: move one control at a time
+ns6 map        # move a control, say what it was; writes ns6-surface.toml
+ns6 learn      # watch the control surface: move a control, see its MIDI
 ns6 probe      # report device state and sweep bulk OUT configurations
 ns6 test       # emit synthetic MIDI on the ALSA port, no hardware needed
 ```
@@ -56,6 +57,36 @@ ns6 test       # emit synthetic MIDI on the ALSA port, no hardware needed
 ```sh
 ns6 test &
 aseqdump -p "Numark NS6"
+```
+
+### Mapping the control surface
+
+`ns6 map` records the panel the way you actually think about it: move
+something, and it tells you what arrived and asks what it was.
+
+```
+  got:
+    ch0 CC   20   value  93   range 0..127   214 msgs   fader/knob (full travel)
+    ch0 CC   52   value  16   range 0..127   198 msgs   fader/knob (full travel)
+  what was that? crossfader
+  recorded #1: crossfader
+```
+
+It pairs up the MSB and LSB halves of a 14-bit control on its own, so a fader
+comes back as one entry with two messages. Enter alone throws a reading away if
+something else got caught in it, and `q` writes `ns6-surface.toml`.
+
+Two things keep the readings clean. It spends a few seconds at startup watching
+an untouched panel, so anything that chatters on its own - the platter sensors
+do, constantly - is kept out of later readings unless it is what dominated
+them. And a reading is only offered once movement has stopped for 600 ms, so a
+fader sweep is captured whole.
+
+The driver claims the device exclusively, so stop the service first if you
+installed it:
+
+```sh
+systemctl stop ns6 && ns6 map ; systemctl start ns6
 ```
 
 ## Device access
