@@ -88,12 +88,16 @@ fn cmd_run() -> Result<(), Box<dyn std::error::Error>> {
     let alive = Arc::new(AtomicBool::new(true));
     install_signal_handler();
 
-    // Submit in the order the Windows driver does: audio in, iso in, iso out,
-    // then MIDI in.
+    // Submit in the order the Windows driver does, which a usbmon capture of
+    // it shows to be: audio in, MIDI in, then the isochronous streams. We had
+    // MIDI last, after both iso streams were already running.
     let _audio_in = unsafe {
-        iso::BulkInStream::start(dev.raw_handle(), p::EP_PCM_IN, p::AUDIO_IN_XFER, 8, false)
+        iso::BulkInStream::start(dev.raw_handle(), p::EP_PCM_IN, p::AUDIO_IN_XFER, 1, false)
     }
     .map_err(|e| format!("audio in queue: libusb error {e}"))?;
+    let _midi_in =
+        unsafe { iso::BulkInStream::start(dev.raw_handle(), p::EP_MIDI_IN, p::BLOCK, 1, true) }
+            .map_err(|e| format!("MIDI in queue: libusb error {e}"))?;
     let _iso_in = unsafe {
         iso::IsoStream::start(
             dev.raw_handle(),
@@ -116,9 +120,6 @@ fn cmd_run() -> Result<(), Box<dyn std::error::Error>> {
         )
     }
     .map_err(|e| format!("iso OUT stream: libusb error {e}"))?;
-    let _midi_in =
-        unsafe { iso::BulkInStream::start(dev.raw_handle(), p::EP_MIDI_IN, p::BLOCK, 8, true) }
-            .map_err(|e| format!("MIDI in queue: libusb error {e}"))?;
     println!("streams up: 0x86, 0x81, 0x02, 0x83");
 
     // Drives the isochronous and bulk completion callbacks.
@@ -141,10 +142,10 @@ fn cmd_run() -> Result<(), Box<dyn std::error::Error>> {
     }));
     // MIDI and audio in come off async bulk queues, drained in the main loop.
     let _midi_in =
-        unsafe { iso::BulkInStream::start(dev.raw_handle(), p::EP_MIDI_IN, p::BLOCK, 8, true) }
+        unsafe { iso::BulkInStream::start(dev.raw_handle(), p::EP_MIDI_IN, p::BLOCK, 1, true) }
             .map_err(|e| format!("MIDI in queue: libusb error {e}"))?;
     let _audio_in = unsafe {
-        iso::BulkInStream::start(dev.raw_handle(), p::EP_PCM_IN, p::AUDIO_IN_XFER, 8, false)
+        iso::BulkInStream::start(dev.raw_handle(), p::EP_PCM_IN, p::AUDIO_IN_XFER, 1, false)
     }
     .map_err(|e| format!("audio in queue: libusb error {e}"))?;
 
@@ -292,9 +293,9 @@ fn cmd_probe() -> Result<(), Box<dyn std::error::Error>> {
     // Async bulk IN queues, mirroring the driver's 8-deep URB queues. A single
     // blocking read leaves gaps where nothing is posted.
     let _midi_in =
-        unsafe { iso::BulkInStream::start(dev.raw_handle(), p::EP_MIDI_IN, p::BLOCK, 8, true) };
+        unsafe { iso::BulkInStream::start(dev.raw_handle(), p::EP_MIDI_IN, p::BLOCK, 1, true) };
     let _audio_in = unsafe {
-        iso::BulkInStream::start(dev.raw_handle(), p::EP_PCM_IN, p::AUDIO_IN_XFER, 8, false)
+        iso::BulkInStream::start(dev.raw_handle(), p::EP_PCM_IN, p::AUDIO_IN_XFER, 1, false)
     };
     match (&_midi_in, &_audio_in) {
         (Ok(_), Ok(_)) => println!("bulk in  : queues up on 0x83 and 0x86"),

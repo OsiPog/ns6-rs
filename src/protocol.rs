@@ -46,8 +46,11 @@ pub const EP_ISO_IN: u8 = 0x81;
 pub const ISO_IN_PACKET: usize = 64;
 
 /// Packets per isochronous transfer, and how many transfers to keep in flight.
-/// `requestIsocOut()` uses 0x28 = 40 packets per URB at high speed (5 at full speed).
-pub const ISO_PACKETS_PER_XFER: usize = 40;
+/// Packets per isochronous URB.
+///
+/// `requestIsocOut()` computes 0x28 = 40 at high speed, but the Windows driver
+/// observed on the wire submits **32**. Matching the observed value.
+pub const ISO_PACKETS_PER_XFER: usize = 32;
 pub const ISO_XFERS: usize = 8;
 
 /// The device exposes two interfaces; both are claimed at alternate setting 1.
@@ -84,8 +87,12 @@ pub const SAMPLE_RATE: u32 = 44_100;
 /// transfer with `OVERFLOW` rather than returning a short read.
 pub const AUDIO_IN_XFER: usize = 0x20000;
 
-/// Transfer size used for the MIDI IN pipe: the endpoint's max packet size.
-pub const BLOCK: usize = 512;
+/// Transfer size used for the MIDI IN pipe.
+///
+/// The Windows driver posts reads of exactly **42 bytes** (`S Bi ep3 -115 42`),
+/// which is also the size of every MIDI packet the device emits. We previously
+/// posted 512 (the endpoint's max packet size); matching the driver.
+pub const BLOCK: usize = 42;
 
 /// Filler the device pads the MIDI IN pipe with. Never real MIDI data there.
 pub const MIDI_IDLE: u8 = 0xFD;

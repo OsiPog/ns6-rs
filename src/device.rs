@@ -64,14 +64,42 @@ impl Ns6 {
     /// `claim_interface` returning `Busy` permanently, with no kernel driver
     /// bound and no process holding the node.
     pub fn open() -> Result<Self, Error> {
-        let handle = rusb::open_device_with_vid_pid(p::VID, p::PID).ok_or(Error::NotFound)?;
+        // Re-enumerate first. OFF BY DEFAULT: this device does not survive
+        // libusb_reset_device - it drops off the bus entirely and needs a
+        // physical replug, the same way it reacts to SET_CONFIGURATION being
+        // repeated. Opt in with NS6_RESET only if you can replug it.
+        //
+        // The intent was to mimic Windows, which is always
+        // handed a freshly enumerated device: its retry loop resets the device
+        // constantly, which is why its status register always reads 0x12. Ours
+        // persists across runs, so without this the device sits in a state the
+        // vendor driver never actually operates it in.
+        if std::env::var("NS6_RESET").is_ok() {
+            if let Some(h) = rusb::open_device_with_vid_pid(p::VID, p::PID) {
+                let _ = h.reset();
+                drop(h);
+            }
+        }
+
+        // After a reset the device re-enumerates under a new address, and udev
+        // has to re-apply permissions, so opening it can fail for a second or
+        // two. Retry rather than give up.
+        let mut handle = None;
+        for _ in 0..40 {
+            if let Some(h) = rusb::open_device_with_vid_pid(p::VID, p::PID) {
+                handle = Some(h);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let handle = handle.ok_or(Error::NotFound)?;
         handle.set_auto_detach_kernel_driver(true).ok();
 
-        // SET_CONFIGURATION is off by default. The Windows driver issues
-        // SELECT_CONFIGURATION during startup, but sending it here made no
-        // difference to streaming and repeating it knocked the device off the
-        // bus entirely, requiring a physical replug. Opt in with NS6_SET_CONFIG.
-        if std::env::var("NS6_SET_CONFIG").is_ok() {
+        // SET_CONFIGURATION, exactly as the vendor driver does. A usbmon
+        // capture of Windows driving this device through QEMU passthrough shows
+        // `00 09 0001 0000` on every init cycle. USBPcap never showed it because
+        // it sits above the Windows bus driver.
+        if std::env::var("NS6_NO_SET_CONFIG").is_err() {
             if let Err(e) = handle.set_active_configuration(1) {
                 eprintln!("set_configuration(1): {e} (continuing)");
             }
@@ -87,11 +115,10 @@ impl Ns6 {
             Err(_) => p::INTERFACES.to_vec(),
         };
         for iface in ifaces {
+            // Claiming is host-side and emits nothing on the wire, so it can
+            // happen here while the visible SET_INTERFACE waits until after the
+            // firmware reads - which is the order the Windows driver uses.
             handle.claim_interface(iface)?;
-            // Straight to alt 1. The Windows driver selects alternate settings
-            // via URB_FUNCTION_SELECT_CONFIGURATION and never visits alt 0, so
-            // the cycle through it was speculative and made no difference.
-            handle.set_alternate_setting(iface, p::ALT_SETTING)?;
         }
 
         Ok(Self { handle })
@@ -179,11 +206,11 @@ impl Ns6 {
     pub fn arm(&self) -> Result<(u8, u8), Error> {
         let mut before = self.status()?;
 
-        // In the Windows capture the device reads back 0x12 when the driver
-        // arms it, so the write performs a real 0->1 transition on bit 5. The
-        // register survives USB resets, so on a machine that has already run
-        // this driver it reads 0x32 and the write is a no-op. Clear the bit
-        // first so the device sees the same edge the vendor driver produces.
+        // The Windows driver always sees 0x12 here and writes 0x32 once, so the
+        // device gets a real 0->1 edge on bit 5. It sees 0x12 because its retry
+        // loop re-enumerates the device, which resets the register; ours
+        // survives between runs and reads back 0x32, making the write a no-op.
+        // Clearing the bit first reproduces the state Windows is handed.
         if before & p::ARM_BIT != 0 {
             let cleared = before & !p::ARM_BIT;
             let wvalue = (cleared as i8) as i16 as u16;
@@ -197,6 +224,7 @@ impl Ns6 {
             )?;
             before = self.status()?;
         }
+
         let wvalue = p::arm_wvalue(before);
         self.handle.write_control(
             p::VENDOR_OUT,
@@ -274,6 +302,15 @@ impl Ns6 {
                 .join(" ")
         );
 
+        // SET_INTERFACE alt 1 on both interfaces, after the firmware reads.
+        // The Windows trace has `01 0b 0001 0000` and `01 0b 0001 0001` exactly
+        // here, and does not visit alt 0 during startup.
+        for iface in p::INTERFACES {
+            if let Err(e) = self.handle.set_alternate_setting(iface, p::ALT_SETTING) {
+                eprintln!("set_alternate_setting({iface}, 1): {e}");
+            }
+        }
+
         let _ = self.status()?;
 
         // Rate is read with wIndex 0 first, then set five times alternating
@@ -307,14 +344,12 @@ impl Ns6 {
             eprintln!("warning: arm bit did not stick (status 0x{after:02X})");
         }
 
-        // No CLEAR_FEATURE here. The Windows driver's ABORT_PIPE and
-        // SYNC_RESET_PIPE_AND_CLEAR_STALL are host-side operations that put no
-        // request on the wire - its control traffic contains no bmRequestType
-        // 0x02 at all - so issuing one is a difference from the driver, not a
-        // match to it. Set NS6_CLEAR_HALT=1 to restore the old behaviour.
-        if std::env::var("NS6_CLEAR_HALT").is_ok() {
-            let _ = self.handle.clear_halt(p::EP_PCM_IN);
-        }
+        // CLEAR_FEATURE(ENDPOINT_HALT) on the audio IN pipe, immediately after
+        // arming and immediately before streaming starts. The Windows trace has
+        // `02 01 0000 0086` once per init cycle, right here. I removed this
+        // earlier on the strength of a USBPcap capture that simply could not see
+        // it - the request is issued below the level USBPcap observes.
+        let _ = self.handle.clear_halt(p::EP_PCM_IN);
         Ok(())
     }
 
