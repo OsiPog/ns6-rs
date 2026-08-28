@@ -1,8 +1,14 @@
 //! ALSA sequencer port, so the NS6 appears as an ordinary MIDI device.
 //!
-//! Mixxx uses PortMidi on Linux, which enumerates ALSA sequencer ports. The
-//! surface port is created with `READ | SUBS_READ` so it shows up as an
-//! available MIDI *input* for other applications to read from.
+//! Mixxx uses PortMidi on Linux, which enumerates ALSA sequencer ports. A port
+//! that is both readable and writable is enumerated twice - once as an input
+//! device, once as an output - under the same name, and Mixxx pairs an input
+//! with an output **by matching name**.
+//!
+//! That pairing is why there is one port here rather than two. With separate
+//! "Numark NS6 MIDI" and "Numark NS6 MIDI OUT" ports, Mixxx found both, paired
+//! neither, and opened only the input - so the control surface worked and the
+//! LEDs could not, however correct the mapping was.
 
 use std::ffi::CString;
 
@@ -10,7 +16,6 @@ use alsa::seq::{EventType, MidiEvent, PortCap, PortInfo, PortType, Seq};
 
 pub const CLIENT_NAME: &str = "Numark NS6";
 pub const PORT_NAME: &str = "Numark NS6 MIDI";
-pub const PORT_NAME_OUT: &str = "Numark NS6 MIDI OUT";
 
 pub struct MidiPort {
     seq: Seq,
@@ -24,25 +29,19 @@ impl MidiPort {
         let seq = Seq::open(None, None, true)?;
         seq.set_client_name(&CString::new(CLIENT_NAME).unwrap())?;
 
-        // Readable + subscribable: this is what Mixxx binds to.
+        // One bidirectional port: the control surface is read from it and LED
+        // feedback is written to it. Both directions have to carry the same
+        // name or Mixxx will not pair them.
         let surface_port = {
             let mut info = PortInfo::empty()?;
             info.set_name(&CString::new(PORT_NAME).unwrap());
-            info.set_capability(PortCap::READ | PortCap::SUBS_READ);
+            info.set_capability(
+                PortCap::READ | PortCap::SUBS_READ | PortCap::WRITE | PortCap::SUBS_WRITE,
+            );
             info.set_type(PortType::MIDI_GENERIC | PortType::APPLICATION);
             seq.create_port(&info)?;
             info.get_port()
         };
-
-        // Writable: LED / display feedback from the host back to the controller.
-        // Registering it is all that is needed; events arrive via subscription.
-        {
-            let mut info = PortInfo::empty()?;
-            info.set_name(&CString::new(PORT_NAME_OUT).unwrap());
-            info.set_capability(PortCap::WRITE | PortCap::SUBS_WRITE);
-            info.set_type(PortType::MIDI_GENERIC | PortType::APPLICATION);
-            seq.create_port(&info)?;
-        }
 
         let encoder = MidiEvent::new(256)?;
         // Expand running status, so consumers always see a complete message.
@@ -63,8 +62,7 @@ impl MidiPort {
 
     pub fn describe(&self) {
         println!("ALSA client {}: \"{CLIENT_NAME}\"", self.client_id());
-        println!("  \"{PORT_NAME}\"     -> read the control surface here (connect Mixxx to this)");
-        println!("  \"{PORT_NAME_OUT}\" <- write LED feedback here");
+        println!("  \"{PORT_NAME}\" - control surface out, LED feedback in (connect Mixxx here)");
     }
 
     /// Encode raw MIDI bytes from the device and publish them on the surface port.

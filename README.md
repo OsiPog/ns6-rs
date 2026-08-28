@@ -59,6 +59,12 @@ ns6 test &
 aseqdump -p "Numark NS6"
 ```
 
+The driver publishes **one** ALSA port that is both readable and writable. That
+matters for Mixxx: PortMidi enumerates such a port twice, once as an input and
+once as an output, and Mixxx pairs an input with an output by matching name.
+Two separately-named ports leave it opening only the input, so the surface works
+and the LEDs silently cannot.
+
 ### Mapping the LEDs
 
 `ns6 leds` walks the output space so you can record what each message lights.
