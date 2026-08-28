@@ -203,33 +203,21 @@ impl Ns6 {
     /// Returns `(before, after)`. On this hardware the register goes `0x12` ->
     /// `0x32` and persists across power cycles. It is level-triggered, so
     /// re-arming an already-armed device is a no-op.
+    /// Put the device into streaming mode.
+    ///
+    /// One vendor `'I'` write with the whole register value in `wValue`. The
+    /// value matters far more than the sequence around it - see
+    /// `protocol::ARM_VALUE`. Returns the register before and after.
     pub fn arm(&self) -> Result<(u8, u8), Error> {
-        let mut before = self.status()?;
-
-        // The Windows driver always sees 0x12 here and writes 0x32 once, so the
-        // device gets a real 0->1 edge on bit 5. It sees 0x12 because its retry
-        // loop re-enumerates the device, which resets the register; ours
-        // survives between runs and reads back 0x32, making the write a no-op.
-        // Clearing the bit first reproduces the state Windows is handed.
-        if before & p::ARM_BIT != 0 {
-            let cleared = before & !p::ARM_BIT;
-            let wvalue = (cleared as i8) as i16 as u16;
-            self.handle.write_control(
-                p::VENDOR_OUT,
-                p::CMD_STATUS,
-                wvalue,
-                p::REG_STATUS,
-                &[],
-                CTRL_TIMEOUT,
-            )?;
-            before = self.status()?;
-        }
-
-        let wvalue = p::arm_wvalue(before);
+        let before = self.status()?;
+        let value = match std::env::var("NS6_ARM") {
+            Ok(v) => u8::from_str_radix(v.trim().trim_start_matches("0x"), 16).unwrap_or(p::ARM_VALUE),
+            Err(_) => p::ARM_VALUE,
+        };
         self.handle.write_control(
             p::VENDOR_OUT,
             p::CMD_STATUS,
-            wvalue,
+            p::status_wvalue(value),
             p::REG_STATUS,
             &[],
             CTRL_TIMEOUT,
@@ -305,8 +293,16 @@ impl Ns6 {
         // SET_INTERFACE alt 1 on both interfaces, after the firmware reads.
         // The Windows trace has `01 0b 0001 0000` and `01 0b 0001 0001` exactly
         // here, and does not visit alt 0 during startup.
-        for iface in p::INTERFACES {
-            if let Err(e) = self.handle.set_alternate_setting(iface, p::ALT_SETTING) {
+        let order: Vec<u8> = match std::env::var("NS6_ALT_ORDER") {
+            Ok(v) => v.split(',').filter_map(|x| x.trim().parse().ok()).collect(),
+            Err(_) => p::INTERFACES.to_vec(),
+        };
+        let alt: u8 = std::env::var("NS6_ALT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(p::ALT_SETTING);
+        for iface in order {
+            if let Err(e) = self.handle.set_alternate_setting(iface, alt) {
                 eprintln!("set_alternate_setting({iface}, 1): {e}");
             }
         }
@@ -339,9 +335,13 @@ impl Ns6 {
         }
 
         let (before, after) = self.arm()?;
-        println!("armed: status 0x{before:02X} -> 0x{after:02X}");
-        if after & p::ARM_BIT == 0 {
-            eprintln!("warning: arm bit did not stick (status 0x{after:02X})");
+        println!(
+            "status: {} -> {}",
+            p::describe_status(before),
+            p::describe_status(after)
+        );
+        if after & p::ENABLE_BIT == 0 {
+            eprintln!("warning: streaming enable did not stick (status 0x{after:02X})");
         }
 
         // CLEAR_FEATURE(ENDPOINT_HALT) on the audio IN pipe, immediately after
@@ -349,7 +349,9 @@ impl Ns6 {
         // `02 01 0000 0086` once per init cycle, right here. I removed this
         // earlier on the strength of a USBPcap capture that simply could not see
         // it - the request is issued below the level USBPcap observes.
-        let _ = self.handle.clear_halt(p::EP_PCM_IN);
+        if std::env::var("NS6_NO_CLEAR_HALT").is_err() {
+            let _ = self.handle.clear_halt(p::EP_PCM_IN);
+        }
         Ok(())
     }
 

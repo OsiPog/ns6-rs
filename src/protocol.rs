@@ -64,8 +64,30 @@ pub const CMD_FIRMWARE: u8 = 0x56;
 pub const CMD_STATUS: u8 = 0x49;
 /// Register index 0 of the `'I'` request: the AJ input selector / status byte.
 pub const REG_STATUS: u16 = 0;
-/// Bit 5 of the status register. Setting it arms the device for streaming.
-pub const ARM_BIT: u8 = 0x20;
+/// Bit 4 of the status register: the streaming enable.
+///
+/// `PGDevice::vendorSelectBitDepth` sets this unconditionally, sets bit 5
+/// (0x20) to select the 16-bit sample container, and `updateAjInputSelector`
+/// maintains bit 1 (0x02) as the analogue input selector.
+pub const ENABLE_BIT: u8 = 0x10;
+/// Bit 5: selects the 16-bit sample container. Must stay **clear** here - this
+/// device streams 24-bit, which is what the 12-byte output frame below assumes.
+pub const WIDTH16_BIT: u8 = 0x20;
+/// Bit 1: analogue input selector.
+pub const INPUT_SEL_BIT: u8 = 0x02;
+
+/// The byte written to the status register to start streaming.
+///
+/// The device powers up reading 0x12, and the Windows driver writes back
+/// 0x32 - `0x12 | 0x20`. Replaying that value verbatim is what kept this
+/// driver from ever working: the device would accept the whole init, answer
+/// exactly one feedback packet, and then go silent for good.
+///
+/// Writing plain **0x10** starts it. Both of the other bits have to be clear:
+/// 0x12, 0x32, 0x33 and 0x3a were all tried against the hardware and all leave
+/// it mute. Clearing 0x20 is the part that matters - it selects the 24-bit
+/// container that the 12-byte, 4-channel output frame actually carries.
+pub const ARM_VALUE: u8 = ENABLE_BIT;
 
 /// Audio class `SET_CUR` (`bmRequestType 0x22`, `bRequest 0x01`, `wValue 0x0100`).
 pub const SET_CUR_TYPE: u8 = 0x22;
@@ -116,13 +138,31 @@ pub const FRAMES_PER_BLOCK: usize = 480 / OUT_FRAME_BYTES;
 const _: () = assert!(FRAMES_PER_BLOCK * OUT_FRAME_BYTES == 480);
 const _: () = assert!(IN_CHANNELS <= OUT_CHANNELS);
 
-/// Compute the `wValue` for the arming write.
+/// Render a status-register byte as its named bits, for the startup log.
+pub fn describe_status(reg: u8) -> String {
+    let mut bits = Vec::new();
+    if reg & ENABLE_BIT != 0 {
+        bits.push("enable");
+    }
+    if reg & WIDTH16_BIT != 0 {
+        bits.push("16-bit");
+    }
+    if reg & INPUT_SEL_BIT != 0 {
+        bits.push("input-sel");
+    }
+    if bits.is_empty() {
+        bits.push("none");
+    }
+    format!("0x{reg:02X} [{}]", bits.join(" "))
+}
+
+/// Encode a status-register byte as the `wValue` of the vendor `'I'` write.
 ///
-/// The vendor driver casts the modified status byte through `(short)(char)`, i.e.
-/// sign-extends it from 8 to 16 bits. Reproduced exactly so that a status byte
-/// with bit 7 set produces the same `0xFFxx` value the device expects.
-pub fn arm_wvalue(status: u8) -> u16 {
-    ((status | ARM_BIT) as i8) as i16 as u16
+/// The vendor driver casts the byte through `(short)(char)`, i.e. sign-extends
+/// it from 8 to 16 bits, so a value with bit 7 set has to become `0xFFxx` and
+/// not `0x00xx`. Reproduced exactly.
+pub fn status_wvalue(value: u8) -> u16 {
+    (value as i8) as i16 as u16
 }
 
 /// Encode a sample rate as the 3-byte little-endian form used by `SET_CUR`.
@@ -167,14 +207,21 @@ mod tests {
     }
 
     #[test]
-    fn arm_wvalue_matches_driver_sign_extension() {
-        // Observed on hardware: status 0x12 -> wValue 0x0032.
-        assert_eq!(arm_wvalue(0x12), 0x0032);
-        // Already armed: setting the bit again is a no-op.
-        assert_eq!(arm_wvalue(0x32), 0x0032);
+    fn status_wvalue_matches_driver_sign_extension() {
+        // The value that actually starts this device.
+        assert_eq!(status_wvalue(ARM_VALUE), 0x0010);
+        // What the Windows driver writes, and what leaves the device mute.
+        assert_eq!(status_wvalue(0x32), 0x0032);
         // Bit 7 set must sign-extend to 0xFFxx, matching `(short)(char)`.
-        assert_eq!(arm_wvalue(0x80), 0xFFA0);
-        assert_eq!(arm_wvalue(0xFF), 0xFFFF);
+        assert_eq!(status_wvalue(0x80), 0xFF80);
+        assert_eq!(status_wvalue(0xFF), 0xFFFF);
+    }
+
+    #[test]
+    fn arm_value_clears_the_width_and_input_select_bits() {
+        assert_eq!(ARM_VALUE & WIDTH16_BIT, 0);
+        assert_eq!(ARM_VALUE & INPUT_SEL_BIT, 0);
+        assert_eq!(ARM_VALUE & ENABLE_BIT, ENABLE_BIT);
     }
 
     #[test]

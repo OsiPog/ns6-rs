@@ -76,11 +76,49 @@ fn running() -> bool {
     RUNNING.load(Ordering::Relaxed)
 }
 
+/// How deep each pipe's queue is and how many packets each isochronous URB
+/// carries. Defaults mirror `captures/ns6.pcap`; every field is overridable so
+/// configurations can be swept against the hardware without a rebuild.
+#[derive(Debug)]
+struct Geometry {
+    pcm_in_depth: usize,
+    midi_in_depth: usize,
+    iso_in_packets: usize,
+    iso_in_xfers: usize,
+    iso_out_packets: usize,
+    iso_out_xfers: usize,
+}
+
+impl Geometry {
+    fn from_env() -> Self {
+        fn v(name: &str, default: usize) -> usize {
+            std::env::var(name)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(default)
+        }
+        Self {
+            pcm_in_depth: v("NS6_PCM_IN_DEPTH", 7),
+            midi_in_depth: v("NS6_MIDI_IN_DEPTH", 5),
+            iso_in_packets: v("NS6_ISO_IN_PACKETS", 5),
+            iso_in_xfers: v("NS6_ISO_IN_XFERS", 9),
+            iso_out_packets: v("NS6_ISO_OUT_PACKETS", 40),
+            iso_out_xfers: v("NS6_ISO_OUT_XFERS", 3),
+        }
+    }
+}
+
 fn cmd_run() -> Result<(), Box<dyn std::error::Error>> {
     let mut port = midi::MidiPort::open()?;
     port.describe();
 
     let dev = Arc::new(Ns6::open()?);
+
+    // Re-run the init until the device starts sending, the way the vendor
+    // driver does. A usbmon capture of Windows shows it repeating the full
+    // sequence roughly once a second - 154 times in 150 seconds - which is not
+    // a VM artefact but the driver retrying until the device latches. We only
+    // ever ran it once.
     dev.start()?;
 
     let stats = Arc::new(Stats::default());
@@ -88,45 +126,63 @@ fn cmd_run() -> Result<(), Box<dyn std::error::Error>> {
     let alive = Arc::new(AtomicBool::new(true));
     install_signal_handler();
 
-    // Submit in the order the Windows driver does, which a usbmon capture of
-    // it shows to be: audio in, MIDI in, then the isochronous streams. We had
-    // MIDI last, after both iso streams were already running.
+    // Submission order, queue depths and isochronous packet counts, all taken
+    // from `captures/ns6.pcap` - a capture of the driver on real Windows while
+    // MIDI was actually flowing. (The later `windows.usbmon` capture from the
+    // VM is *not* a working reference: in it endpoint 0x83 was cancelled 292
+    // times without ever delivering a byte, so the VM's Windows driver was
+    // failing in exactly the way ours does.)
+    //
+    // The working driver posts, within 600us of the last control transfer:
+    //   7 x bulk IN  0x86, 131072 bytes each
+    //   9 x iso  IN  0x81,  5 packets each  (bInterval 4 -> 1ms per packet)
+    //   3 x iso  OUT 0x02, 40 packets each  (bInterval 1 -> 125us per packet)
+    //   5 x bulk IN  0x83,  42 bytes each
+    // and the device starts streaming ~7ms later.
+    let g = Geometry::from_env();
     let _audio_in = unsafe {
-        iso::BulkInStream::start(dev.raw_handle(), p::EP_PCM_IN, p::AUDIO_IN_XFER, 1, false)
+        iso::BulkInStream::start(
+            dev.raw_handle(),
+            p::EP_PCM_IN,
+            p::AUDIO_IN_XFER,
+            g.pcm_in_depth,
+            false,
+        )
     }
     .map_err(|e| format!("audio in queue: libusb error {e}"))?;
-    thread::sleep(Duration::from_micros(900));
-    let _midi_in =
-        unsafe { iso::BulkInStream::start(dev.raw_handle(), p::EP_MIDI_IN, p::BLOCK, 1, true) }
-            .map_err(|e| format!("MIDI in queue: libusb error {e}"))?;
-
-    // The vendor driver waits ~3.5ms here and ~8ms before the isochronous OUT
-    // stream, letting the IN side settle first. We were firing everything
-    // within ~100us of the last control transfer.
-    thread::sleep(Duration::from_micros(3500));
     let _iso_in = unsafe {
         iso::IsoStream::start(
             dev.raw_handle(),
             p::EP_ISO_IN,
             p::ISO_IN_PACKET,
-            p::ISO_PACKETS_PER_XFER,
-            4,
+            g.iso_in_packets,
+            g.iso_in_xfers,
             None,
         )
     }
     .map_err(|e| format!("iso IN stream: libusb error {e}"))?;
-    thread::sleep(Duration::from_millis(8));
     let _iso_out = unsafe {
         iso::IsoStream::start(
             dev.raw_handle(),
             p::EP_ISO_OUT,
             p::ISO_OUT_PACKET,
-            p::ISO_PACKETS_PER_XFER,
-            p::ISO_XFERS,
+            g.iso_out_packets,
+            g.iso_out_xfers,
             Some((p::OUT_FRAME_BYTES, p::SAMPLE_RATE as u64)),
         )
     }
     .map_err(|e| format!("iso OUT stream: libusb error {e}"))?;
+    let _midi_in = unsafe {
+        iso::BulkInStream::start(
+            dev.raw_handle(),
+            p::EP_MIDI_IN,
+            p::BLOCK,
+            g.midi_in_depth,
+            true,
+        )
+    }
+    .map_err(|e| format!("MIDI in queue: libusb error {e}"))?;
+    println!("geometry: {g:?}");
     println!("streams up: 0x86, 0x81, 0x02, 0x83");
 
     // Drives the isochronous and bulk completion callbacks.
@@ -147,21 +203,6 @@ fn cmd_run() -> Result<(), Box<dyn std::error::Error>> {
         let (dev, stats, running) = (dev.clone(), stats.clone(), alive.clone());
         move || device::run_midi_out(dev, stats, running, midi_rx)
     }));
-    // MIDI and audio in come off async bulk queues, drained in the main loop.
-    thread::sleep(Duration::from_micros(900));
-    let _midi_in =
-        unsafe { iso::BulkInStream::start(dev.raw_handle(), p::EP_MIDI_IN, p::BLOCK, 1, true) }
-            .map_err(|e| format!("MIDI in queue: libusb error {e}"))?;
-
-    // The vendor driver waits ~3.5ms here and ~8ms before the isochronous OUT
-    // stream, letting the IN side settle first. We were firing everything
-    // within ~100us of the last control transfer.
-    thread::sleep(Duration::from_micros(3500));
-    let _audio_in = unsafe {
-        iso::BulkInStream::start(dev.raw_handle(), p::EP_PCM_IN, p::AUDIO_IN_XFER, 1, false)
-    }
-    .map_err(|e| format!("audio in queue: libusb error {e}"))?;
-
     println!(
         "\nbridge running - connect Mixxx to \"{}\". Ctrl-C to stop.\n",
         midi::CLIENT_NAME
