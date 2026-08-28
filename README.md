@@ -71,7 +71,10 @@ through the same pipe, using byte patterns `addr | 0x00/0x40/0x80/0xC0/0xE0` as
 clock and data. Sweeping arbitrary bytes therefore clocks arbitrary bits into
 that chip. A power cycle recovers it.
 
-So the walk saves after every description and can be resumed:
+One message is confirmed to do it: **CC 57 on channel 1**, the 58th candidate.
+The walk steps over that one rather than sending it; `NS6_LED_UNSAFE=1` sends it
+anyway. Others may well exist, so the walk saves after every description and can
+be resumed:
 
 ```sh
 NS6_LED_START=58 ns6 leds

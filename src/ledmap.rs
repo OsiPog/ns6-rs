@@ -49,6 +49,20 @@ pub struct Found {
     pub description: String,
 }
 
+/// Messages that are known to take the device off the USB bus.
+///
+/// The MIDI OUT stream carries more than MIDI: the vendor driver bit-bangs a
+/// serial register interface into an audio chip through it, clocking bits with
+/// the byte patterns `addr | 0x00/0x40/0x80/0xC0/0xE0`. Some byte sequences
+/// therefore reach hardware that has nothing to do with lighting buttons.
+///
+/// `(kind, channel, number)`. Found the hard way; the walk steps over them
+/// rather than sending them, unless `NS6_LED_UNSAFE` is set.
+pub const HAZARDS: &[(u8, u8, u8)] = &[
+    // Confirmed twice: this one drops the device and needs a power cycle.
+    (0xB0, 0, 57),
+];
+
 pub struct LedWalk {
     candidates: Vec<Candidate>,
     index: usize,
@@ -88,6 +102,13 @@ impl LedWalk {
 
     pub fn current(&self) -> Option<Candidate> {
         self.candidates.get(self.index).copied()
+    }
+
+    /// Whether this candidate is one of the known-destructive messages.
+    pub fn is_hazard(&self, c: Candidate) -> bool {
+        HAZARDS
+            .iter()
+            .any(|&(k, ch, n)| k == c.kind && ch == c.channel && n == c.number)
     }
 
     pub fn position(&self) -> (usize, usize) {

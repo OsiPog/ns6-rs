@@ -750,7 +750,9 @@ fn cmd_leds() -> Result<(), Box<dyn std::error::Error>> {
          right arrow   send the next one; hold to skim\n    \
          left arrow    go back; hold to skim backwards\n    \
          Enter         describe what is lit; Enter again saves it\n    \
-         q             stop and write ns6-leds.toml\n"
+         q             stop and write ns6-leds.toml\n\n\
+         Messages known to take the device off the bus are stepped over rather\n\
+         than sent. NS6_LED_UNSAFE=1 sends them anyway.\n"
     );
 
     let Some(raw) = term::RawMode::enable() else {
@@ -808,6 +810,15 @@ fn cmd_leds() -> Result<(), Box<dyn std::error::Error>> {
                     walk.back()
                 };
                 match next {
+                    Some(c) if walk.is_hazard(c) && std::env::var("NS6_LED_UNSAFE").is_err() => {
+                        lit = None;
+                        let (n, total) = walk.position();
+                        print!(
+                            "\r\x1b[K  [{n}/{total}] {}   SKIPPED - known to drop the device",
+                            c.describe()
+                        );
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                    }
                     Some(c) => {
                         if let Err(e) = send(c, true) {
                             let (n, _) = walk.position();
