@@ -33,6 +33,14 @@ chipset for Allen & Heath Xone hardware. It does **not** know vendor `15e4`, and
 NS6 differs from the Xone in two important ways (endpoint numbers, and the control
 byte value), so its constants cannot be adopted wholesale.
 
+## A note on the captures
+
+Comments in the source and the tables below cite `captures/ns6.pcap`,
+`captures/windows.usbmon` and friends. Those files are not distributed with this
+repository — `ns6.pcap` alone is 36 MB, and they are recordings of one particular
+unit on one particular machine. The citations are kept because they say where
+each claim came from; everything they establish is written down here.
+
 ## Endpoints
 
 `findInterfacesInConfig()` first looks for an interface with `class == 1 && subclass

@@ -122,18 +122,33 @@ against a documented wire protocol.
 
 ## Working on the hardware
 
-`tools/powercycle.sh` cuts and restores the controller's mains power through a
-Zigbee smart plug, and `tools/trial.sh` wraps a power cycle, a timed run and a
-usbmon capture into one line that reports whether the device actually streamed:
+Almost every startup parameter can be overridden from the environment, so
+configurations can be swept against the device without a rebuild:
+
+| Variable | Default | What it changes |
+|---|---|---|
+| `NS6_ARM` | `10` | Byte written to the vendor status register, in hex |
+| `NS6_ISO_OUT_PACKETS` / `NS6_ISO_OUT_XFERS` | 40 / 3 | Isochronous OUT geometry |
+| `NS6_ISO_IN_PACKETS` / `NS6_ISO_IN_XFERS` | 5 / 9 | Feedback pipe geometry |
+| `NS6_PCM_IN_DEPTH` / `NS6_MIDI_IN_DEPTH` | 7 / 5 | Bulk IN queue depths |
+| `NS6_ALT_ORDER` | `0,1` | Order the interfaces are set to alt 1 |
+| `NS6_IFACES` | `0,1` | Which interfaces to claim |
+| `NS6_NO_SET_CONFIG`, `NS6_NO_CLEAR_HALT`, `NS6_DESCRIPTORS` | off | Init steps to drop or add |
+
+These exist because that is how the register value was found. This device is
+stateful across runs and its failure mode is silence, so each candidate has to
+be tried against hardware that has been power-cycled first. The rig used here
+drives the controller's mains through a Zigbee smart plug and wraps a cycle, a
+timed run and a `usbmon` capture into one line that says whether the device
+streamed — roughly:
 
 ```sh
-tools/trial.sh 10 baseline
-NS6_ARM=0x32 tools/trial.sh 10 windows-value
+NS6_ARM=32 trial 10 windows-value    # mute
+NS6_ARM=10 trial 10 candidate        # 45 MB of audio, feedback, MIDI
 ```
 
-That pair is what found the register value: every plausible variation could be
-tried from a known-cold device without anyone reaching for a cable. The
-environment variables it passes through (`NS6_ARM`, `NS6_ISO_OUT_PACKETS`,
-`NS6_PCM_IN_DEPTH`, `NS6_ALT_ORDER`, …) exist for exactly that.
+Those scripts are not in this repository; they hard-code one particular MQTT
+broker and smart plug. The environment variables are the reusable part.
 
-The plug is specific to this setup; edit the topic in `tools/powercycle.sh`.
+Neither are the USB captures the source comments cite — `ns6.pcap` alone is
+36 MB. What they establish is written down in [docs/PROTOCOL.md](docs/PROTOCOL.md).
