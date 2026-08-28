@@ -95,9 +95,15 @@ fn cmd_run() -> Result<(), Box<dyn std::error::Error>> {
         iso::BulkInStream::start(dev.raw_handle(), p::EP_PCM_IN, p::AUDIO_IN_XFER, 1, false)
     }
     .map_err(|e| format!("audio in queue: libusb error {e}"))?;
+    thread::sleep(Duration::from_micros(900));
     let _midi_in =
         unsafe { iso::BulkInStream::start(dev.raw_handle(), p::EP_MIDI_IN, p::BLOCK, 1, true) }
             .map_err(|e| format!("MIDI in queue: libusb error {e}"))?;
+
+    // The vendor driver waits ~3.5ms here and ~8ms before the isochronous OUT
+    // stream, letting the IN side settle first. We were firing everything
+    // within ~100us of the last control transfer.
+    thread::sleep(Duration::from_micros(3500));
     let _iso_in = unsafe {
         iso::IsoStream::start(
             dev.raw_handle(),
@@ -109,6 +115,7 @@ fn cmd_run() -> Result<(), Box<dyn std::error::Error>> {
         )
     }
     .map_err(|e| format!("iso IN stream: libusb error {e}"))?;
+    thread::sleep(Duration::from_millis(8));
     let _iso_out = unsafe {
         iso::IsoStream::start(
             dev.raw_handle(),
@@ -141,9 +148,15 @@ fn cmd_run() -> Result<(), Box<dyn std::error::Error>> {
         move || device::run_midi_out(dev, stats, running, midi_rx)
     }));
     // MIDI and audio in come off async bulk queues, drained in the main loop.
+    thread::sleep(Duration::from_micros(900));
     let _midi_in =
         unsafe { iso::BulkInStream::start(dev.raw_handle(), p::EP_MIDI_IN, p::BLOCK, 1, true) }
             .map_err(|e| format!("MIDI in queue: libusb error {e}"))?;
+
+    // The vendor driver waits ~3.5ms here and ~8ms before the isochronous OUT
+    // stream, letting the IN side settle first. We were firing everything
+    // within ~100us of the last control transfer.
+    thread::sleep(Duration::from_micros(3500));
     let _audio_in = unsafe {
         iso::BulkInStream::start(dev.raw_handle(), p::EP_PCM_IN, p::AUDIO_IN_XFER, 1, false)
     }
