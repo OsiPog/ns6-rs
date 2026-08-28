@@ -8,6 +8,7 @@
 
 mod device;
 mod iso;
+mod ledmap;
 mod learn;
 mod midi;
 mod protocol;
@@ -27,6 +28,8 @@ fn usage() -> ! {
          \n\
          USAGE:\n    \
              ns6 [run]     bridge the controller to an ALSA MIDI port (default)\n    \
+             ns6 led       light the controller's buttons, to check LED output\n    \
+             ns6 leds      walk the LED space and record what each note lights\n    \
              ns6 probe     report device state and sweep bulk OUT configurations\n    \
              ns6 learn     watch the control surface: move a control, see its MIDI\n    \
              ns6 map       move a control, say what it was; writes ns6-surface.toml\n    \
@@ -43,6 +46,8 @@ fn main() {
         "run" => cmd_run(Mode::Bridge),
         "learn" => cmd_run(Mode::Learn),
         "map" => cmd_run(Mode::Map),
+        "led" => cmd_led(),
+        "leds" => cmd_leds(),
         "probe" => cmd_probe(),
         "test" => cmd_test(),
         "-h" | "--help" | "help" => usage(),
@@ -573,5 +578,264 @@ fn cmd_test() -> Result<(), Box<dyn std::error::Error>> {
         thread::sleep(Duration::from_millis(50));
     }
     println!("\nstopped");
+    Ok(())
+}
+
+/// Drive the controller's LEDs, with no ALSA port and no streaming threads.
+///
+/// The device lights a button when it is sent the note that button sends, so
+/// this is also a way to read the LED map off the hardware: it walks every note
+/// on every channel and you watch what comes on.
+///
+///     ns6 led                 light everything at once, then clear
+///     ns6 led sweep           walk note by note, to read the LED map off
+///     ns6 led 1 0x11 127      one message: channel, note, velocity
+fn cmd_led() -> Result<(), Box<dyn std::error::Error>> {
+    let (dev, _streams) = open_for_output()?;
+    install_signal_handler();
+
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let parse = |s: &String| -> Option<u8> {
+        let s = s.trim();
+        if let Some(hex) = s.strip_prefix("0x") {
+            u8::from_str_radix(hex, 16).ok()
+        } else {
+            s.parse().ok()
+        }
+    };
+
+    if args.len() == 3 {
+        let (ch, note, vel) = (
+            parse(&args[0]).unwrap_or(0),
+            parse(&args[1]).unwrap_or(0),
+            parse(&args[2]).unwrap_or(0),
+        );
+        println!("note on: channel {ch} note 0x{note:02X} velocity {vel}");
+        dev.write_midi(&[0x90 | (ch & 0x0F), note, vel])?;
+        thread::sleep(Duration::from_secs(3));
+    } else if args.first().map(String::as_str) == Some("sweep") {
+        println!(
+            "Walking every note on channels 1-5. Each lights for a moment, then\n\
+             clears. Note which button responds to which number.\n"
+        );
+        for ch in 0..5u8 {
+            for note in 0..0x60u8 {
+                if !running() {
+                    break;
+                }
+                print!("\r  channel {} note 0x{note:02X}   ", ch + 1);
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                dev.write_midi(&[0x90 | ch, note, 0x7F])?;
+                thread::sleep(Duration::from_millis(400));
+                dev.write_midi(&[0x90 | ch, note, 0x00])?;
+            }
+        }
+        println!();
+    } else {
+        // Everything at once: the quickest way to see whether LED output works
+        // at all, and which channels reach which half of the panel.
+        println!("lighting every note on channels 1-5 for 6 seconds...");
+        for ch in 0..5u8 {
+            for note in 0..0x60u8 {
+                dev.write_midi(&[0x90 | ch, note, 0x7F])?;
+            }
+        }
+        thread::sleep(Duration::from_secs(6));
+    }
+
+    // Leave nothing lit.
+    for ch in 0..5u8 {
+        for note in 0..0x60u8 {
+            let _ = dev.write_midi(&[0x90 | ch, note, 0x00]);
+        }
+    }
+
+    Ok(())
+}
+
+/// Bring the streams up without an ALSA port, for the LED commands.
+///
+/// The device accepts MIDI only while it is streaming, so the pipes have to be
+/// running even though nothing here reads from them.
+fn open_for_output() -> Result<(Ns6, Streams), Box<dyn std::error::Error>> {
+    let dev = Ns6::open()?;
+    dev.start()?;
+    let audio_in = unsafe {
+        iso::BulkInStream::start(dev.raw_handle(), p::EP_PCM_IN, p::AUDIO_IN_XFER, 7, false)
+    }
+    .map_err(|e| format!("audio in queue: libusb error {e}"))?;
+    let iso_in = unsafe {
+        iso::IsoStream::start(dev.raw_handle(), p::EP_ISO_IN, p::ISO_IN_PACKET, 5, 9, None)
+    }
+    .map_err(|e| format!("iso IN stream: libusb error {e}"))?;
+    let iso_out = unsafe {
+        iso::IsoStream::start(
+            dev.raw_handle(),
+            p::EP_ISO_OUT,
+            p::ISO_OUT_PACKET,
+            40,
+            3,
+            Some((p::OUT_FRAME_BYTES, p::SAMPLE_RATE as u64)),
+        )
+    }
+    .map_err(|e| format!("iso OUT stream: libusb error {e}"))?;
+    let alive = Arc::new(AtomicBool::new(true));
+    let pump = thread::spawn({
+        let alive = alive.clone();
+        move || {
+            while alive.load(Ordering::Relaxed) {
+                iso::pump_events();
+            }
+        }
+    });
+    Ok((
+        dev,
+        Streams {
+            alive,
+            pump: Some(pump),
+            _audio_in: audio_in,
+            _iso_in: iso_in,
+            _iso_out: iso_out,
+        },
+    ))
+}
+
+/// Keeps the streams and their event pump alive for as long as it is held.
+struct Streams {
+    alive: Arc<AtomicBool>,
+    pump: Option<thread::JoinHandle<()>>,
+    _audio_in: iso::BulkInStream,
+    _iso_in: iso::IsoStream,
+    _iso_out: iso::IsoStream,
+}
+
+impl Drop for Streams {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Relaxed);
+        if let Some(p) = self.pump.take() {
+            let _ = p.join();
+        }
+    }
+}
+
+/// Walk the LED space, recording what each note lights.
+///
+/// Runs on its own with one LED lit at a time, because most of the several
+/// hundred notes will do nothing and prompting for each would be unusable.
+/// Enter interrupts, which is when the typing starts.
+fn cmd_leds() -> Result<(), Box<dyn std::error::Error>> {
+    let dwell = Duration::from_millis(
+        std::env::var("NS6_LED_DWELL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(700),
+    );
+    let (dev, _streams) = open_for_output()?;
+    install_signal_handler();
+
+    let mut walk = ledmap::LedWalk::new(5, 0x80);
+    println!(
+        "\nWalking every note on channels 1-5, one lit at a time, {} ms each.\n\n\
+         Watch the panel. The moment something lights:\n    \
+         Enter   hold here and send it again, so you can look properly\n    \
+         text    what it lit - recorded, then the walk resumes\n    \
+         -       nothing after all, resume\n    \
+         b       step back one, if you noticed it a moment late\n    \
+         q       stop and write ns6-leds.toml\n",
+        dwell.as_millis()
+    );
+
+    let (tx, rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        let mut line = String::new();
+        while std::io::stdin().read_line(&mut line).unwrap_or(0) > 0 {
+            if tx.send(line.trim_end().to_string()).is_err() {
+                break;
+            }
+            line.clear();
+        }
+    });
+
+    let send = |c: ledmap::Candidate, on: bool| -> Result<(), device::Error> {
+        dev.write_midi(&[0x90 | (c.channel & 0x0F), c.note, if on { 0x7F } else { 0x00 }])
+            .map(|_| ())
+    };
+
+    let mut lit = walk.current();
+    if let Some(c) = lit {
+        send(c, true)?;
+    }
+    let mut since = Instant::now();
+
+    while running() && !walk.done() {
+        if let Ok(line) = rx.try_recv() {
+            let line = line.trim().to_string();
+            let here = walk.current();
+            if line.eq_ignore_ascii_case("q") {
+                break;
+            } else if line.is_empty() {
+                // Hold position and flash it again, so it is unmistakable.
+                walk.paused = true;
+                if let Some(c) = here {
+                    send(c, false)?;
+                    thread::sleep(Duration::from_millis(150));
+                    send(c, true)?;
+                    println!("  holding: {}   (describe it, or - to resume)", c.describe());
+                }
+            } else if line == "-" {
+                walk.paused = false;
+                since = Instant::now();
+            } else if line.eq_ignore_ascii_case("b") {
+                if let Some(c) = lit {
+                    send(c, false)?;
+                }
+                let c = walk.back();
+                lit = c;
+                if let Some(c) = c {
+                    send(c, true)?;
+                    println!("  back to: {}", c.describe());
+                }
+                walk.paused = true;
+            } else {
+                walk.record(&line);
+                let (n, total) = walk.position();
+                println!(
+                    "  recorded [{n}/{total}] {} = {line}",
+                    here.map(|c| c.describe()).unwrap_or_default()
+                );
+                walk.paused = false;
+                since = Instant::now();
+            }
+        }
+
+        if !walk.paused && since.elapsed() >= dwell {
+            if let Some(c) = lit {
+                send(c, false)?;
+            }
+            let next = walk.advance();
+            lit = next;
+            if let Some(c) = next {
+                send(c, true)?;
+                let (n, total) = walk.position();
+                print!("\r  [{n}/{total}] {}          ", c.describe());
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            }
+            since = Instant::now();
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Leave nothing lit.
+    for ch in 0..5u8 {
+        for note in 0..0x80u8 {
+            let _ = dev.write_midi(&[0x90 | ch, note, 0x00]);
+        }
+    }
+
+    let path = std::path::Path::new("ns6-leds.toml");
+    match std::fs::write(path, walk.to_toml()) {
+        Ok(()) => println!("\n\nwrote {} LEDs to {}", walk.found.len(), path.display()),
+        Err(e) => eprintln!("\ncould not write {}: {e}", path.display()),
+    }
     Ok(())
 }

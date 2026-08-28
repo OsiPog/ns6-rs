@@ -119,6 +119,43 @@ pub const BLOCK: usize = 42;
 /// Filler the device pads the MIDI IN pipe with. Never real MIDI data there.
 pub const MIDI_IDLE: u8 = 0xFD;
 
+/// MIDI **out** is framed, unlike MIDI in. `AJMidi::sendPacket_numark42` builds
+/// a fixed 42-byte packet for every write, whatever it is carrying:
+///
+/// ```text
+/// [0 .. 39)  up to 39 MIDI bytes
+/// [39, 40]   0xFD filler
+/// [41]       device control byte
+/// ```
+///
+/// The whole buffer is pre-filled with `0xFD` and only then overwritten, so a
+/// short message is padded rather than truncated. Writing raw MIDI to the pipe
+/// without this frame does nothing at all: the device's parser never sees it.
+///
+/// `USBMidiPattern::initForNumark` fills all 256 pattern slots with 0x27, which
+/// is where the 39 comes from - it is a per-device constant, not a maximum the
+/// driver negotiates.
+pub const MIDI_OUT_PACKET: usize = 42;
+/// MIDI bytes one packet can carry.
+pub const MIDI_OUT_PAYLOAD: usize = 39;
+/// Index of the device control byte within the packet (`packet[0x29]`).
+pub const MIDI_OUT_CTRL: usize = 41;
+/// What the vendor driver initialises the control byte to, and leaves it at
+/// unless something pushes a command into the control ring.
+pub const MIDI_CTRL_DEFAULT: u8 = 0xE0;
+
+/// Frame up to [`MIDI_OUT_PAYLOAD`] MIDI bytes for the device's MIDI OUT pipe.
+///
+/// # Panics
+/// If `midi` is longer than [`MIDI_OUT_PAYLOAD`].
+pub fn build_midi_out(midi: &[u8], ctrl: u8) -> [u8; MIDI_OUT_PACKET] {
+    assert!(midi.len() <= MIDI_OUT_PAYLOAD, "MIDI payload too long for one packet");
+    let mut packet = [MIDI_IDLE; MIDI_OUT_PACKET];
+    packet[..midi.len()].copy_from_slice(midi);
+    packet[MIDI_OUT_CTRL] = ctrl;
+    packet
+}
+
 /// Output channel count for this PID at high speed, from `findInterfacesInConfig()`.
 pub const OUT_CHANNELS: usize = 4;
 /// Input channel count for this PID (overridden to 2 for the `15e4` DJ controllers).
@@ -222,6 +259,26 @@ mod tests {
         assert_eq!(ARM_VALUE & WIDTH16_BIT, 0);
         assert_eq!(ARM_VALUE & INPUT_SEL_BIT, 0);
         assert_eq!(ARM_VALUE & ENABLE_BIT, ENABLE_BIT);
+    }
+
+    #[test]
+    fn midi_out_is_framed_to_42_bytes() {
+        let p = build_midi_out(&[0x91, 0x11, 0x7F], MIDI_CTRL_DEFAULT);
+        assert_eq!(p.len(), 42);
+        assert_eq!(&p[..3], &[0x91, 0x11, 0x7F]);
+        // Everything between the payload and the control byte is filler.
+        assert!(p[3..MIDI_OUT_CTRL].iter().all(|&b| b == MIDI_IDLE));
+        assert_eq!(p[MIDI_OUT_CTRL], MIDI_CTRL_DEFAULT);
+    }
+
+    #[test]
+    fn a_full_payload_still_leaves_the_control_byte_alone() {
+        let full = [0x90u8; MIDI_OUT_PAYLOAD];
+        let p = build_midi_out(&full, MIDI_CTRL_DEFAULT);
+        assert_eq!(&p[..MIDI_OUT_PAYLOAD], &full);
+        assert_eq!(p[39], MIDI_IDLE);
+        assert_eq!(p[40], MIDI_IDLE);
+        assert_eq!(p[MIDI_OUT_CTRL], MIDI_CTRL_DEFAULT);
     }
 
     #[test]

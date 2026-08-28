@@ -380,9 +380,17 @@ impl Ns6 {
         Ok(u32::from(buf[0]) | u32::from(buf[1]) << 8 | u32::from(buf[2]) << 16)
     }
 
-    /// Write raw MIDI bytes to the controller (LEDs and display feedback).
-    pub fn write_midi(&self, buf: &[u8]) -> Result<usize, Error> {
-        Ok(self.handle.write_bulk(p::EP_MIDI_OUT, buf, XFER_TIMEOUT)?)
+    /// Send MIDI to the controller (LEDs and display feedback).
+    ///
+    /// `midi` is framed into one 42-byte packet, so at most
+    /// [`protocol::MIDI_OUT_PAYLOAD`] bytes go per call. Returns how many MIDI
+    /// bytes were accepted, not how many bytes went on the wire.
+    pub fn write_midi(&self, midi: &[u8]) -> Result<usize, Error> {
+        let n = midi.len().min(p::MIDI_OUT_PAYLOAD);
+        let packet = p::build_midi_out(&midi[..n], p::MIDI_CTRL_DEFAULT);
+        self.handle
+            .write_bulk(p::EP_MIDI_OUT, &packet, XFER_TIMEOUT)?;
+        Ok(n)
     }
 
     /// Raw libusb handle, for the isochronous streams.
@@ -411,6 +419,7 @@ pub fn run_midi_out(
             std::thread::sleep(Duration::from_millis(2));
             continue;
         }
+        // One packet per write; the loop comes straight back for the rest.
         match dev.write_midi(&pending) {
             Ok(n) => {
                 stats.out_ok.fetch_add(1, Ordering::Relaxed);
