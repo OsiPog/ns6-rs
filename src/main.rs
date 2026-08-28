@@ -742,6 +742,15 @@ fn cmd_leds() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     walk.load(std::path::Path::new(LED_MAP));
+    // Positions as displayed, so a message that dropped the device can be ruled
+    // out without waiting to trip over it again.
+    if let Ok(list) = std::env::var("NS6_LED_SKIP") {
+        for n in list.split(',').filter_map(|v| v.trim().parse::<usize>().ok()) {
+            if let Some(c) = walk.mark_hazard_at(n) {
+                println!("skipping [{n}] {}", c.describe());
+            }
+        }
+    }
     let (_, total) = walk.position();
     println!(
         "\n{total} candidates: control change then note on, channels 1-5.\n\n\
@@ -822,12 +831,14 @@ fn cmd_leds() -> Result<(), Box<dyn std::error::Error>> {
                     Some(c) => {
                         if let Err(e) = send(c, true) {
                             let (n, _) = walk.position();
+                            // Remember it, so the resume steps straight over it.
+                            walk.mark_hazard(c);
+                            let _ = std::fs::write(LED_MAP, walk.to_toml());
                             println!(
                                 "\n\n  the device stopped responding at [{n}] {}\n  \
-                                 ({e})\n\n  Power-cycle it, then carry on with:\n      \
-                                 NS6_LED_START={} ns6 leds",
-                                c.describe(),
-                                n + 1
+                                 ({e})\n\n  Recorded as destructive. Power-cycle it, then:\n      \
+                                 NS6_LED_START={n} ns6 leds",
+                                c.describe()
                             );
                             break;
                         }

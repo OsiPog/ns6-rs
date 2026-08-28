@@ -65,6 +65,9 @@ pub const HAZARDS: &[(u8, u8, u8)] = &[
 
 pub struct LedWalk {
     candidates: Vec<Candidate>,
+    /// Messages found to drop the device, on top of the built-in [`HAZARDS`].
+    /// Persisted with the map, so a resumed walk steps over them by itself.
+    learned: Vec<(u8, u8, u8)>,
     index: usize,
     /// False until the first step, so that step lands on the first candidate
     /// rather than the second.
@@ -94,6 +97,7 @@ impl LedWalk {
         }
         Self {
             candidates,
+            learned: Vec::new(),
             index: 0,
             started: false,
             found: Vec::new(),
@@ -104,11 +108,25 @@ impl LedWalk {
         self.candidates.get(self.index).copied()
     }
 
-    /// Whether this candidate is one of the known-destructive messages.
+    /// Whether this candidate is known to be destructive.
     pub fn is_hazard(&self, c: Candidate) -> bool {
-        HAZARDS
-            .iter()
-            .any(|&(k, ch, n)| k == c.kind && ch == c.channel && n == c.number)
+        let key = (c.kind, c.channel, c.number);
+        HAZARDS.contains(&key) || self.learned.contains(&key)
+    }
+
+    /// Remember that this one took the device down, so a resume steps over it.
+    pub fn mark_hazard(&mut self, c: Candidate) {
+        let key = (c.kind, c.channel, c.number);
+        if !self.learned.contains(&key) && !HAZARDS.contains(&key) {
+            self.learned.push(key);
+        }
+    }
+
+    /// Mark candidates by their displayed position, for `NS6_LED_SKIP`.
+    pub fn mark_hazard_at(&mut self, position: usize) -> Option<Candidate> {
+        let c = *self.candidates.get(position.checked_sub(1)?)?;
+        self.mark_hazard(c);
+        Some(c)
     }
 
     pub fn position(&self) -> (usize, usize) {
@@ -152,6 +170,13 @@ impl LedWalk {
             "# Numark NS6 LED map, recorded with `ns6 leds`.\n\
              # Send the message to the device to light what is described.\n",
         );
+        for &(kind, channel, number) in &self.learned {
+            let _ = write!(
+                s,
+                "\n[[hazard]]  # took the device off the bus\nchannel = {channel}\nkind = \"{}\"\nnumber = {number}  # 0x{number:02X}\n",
+                if kind == 0xB0 { "cc" } else { "note" }
+            );
+        }
         for f in &self.found {
             let _ = write!(
                 s,
@@ -186,44 +211,61 @@ impl LedWalk {
     }
 
     /// Re-read a map written by an earlier run, so a resumed walk keeps what it
-    /// already found. Unparseable or missing files are simply ignored.
+    /// already found and steps over what already broke it. Unparseable or
+    /// missing files are ignored.
     pub fn load(&mut self, path: &std::path::Path) {
         let Ok(text) = std::fs::read_to_string(path) else {
             return;
         };
-        let (mut description, mut channel, mut kind, mut number) =
-            (None, None, None, None::<u8>);
+        // Section-aware, because hazards and described LEDs share field names
+        // and only differ by which table they sit in.
+        let mut in_hazard = false;
+        let (mut description, mut channel, mut kind, mut number) = (None, None, None, None::<u8>);
+        let field = |l: &str| l.split('=').nth(1).map(|v| v.trim().to_string());
+
         for line in text.lines() {
             let line = line.trim();
-            let value = |l: &str| l.split('=').nth(1).map(|v| v.trim().to_string());
+            if line.starts_with("[[") {
+                in_hazard = line.starts_with("[[hazard]]");
+                description = None;
+                channel = None;
+                kind = None;
+                number = None;
+                continue;
+            }
             if line.starts_with("description") {
-                description = value(line).map(|v| v.trim_matches('"').to_string());
+                description = field(line).map(|v| v.trim_matches('"').to_string());
             } else if line.starts_with("channel") {
-                channel = value(line).and_then(|v| v.parse::<u8>().ok());
+                channel = field(line).and_then(|v| v.parse::<u8>().ok());
             } else if line.starts_with("kind") {
-                kind = value(line).map(|v| {
-                    if v.contains("cc") {
-                        0xB0u8
-                    } else {
-                        0x90
-                    }
-                });
+                kind = field(line).map(|v| if v.contains("cc") { 0xB0u8 } else { 0x90 });
             } else if line.starts_with("number") {
-                number = value(line)
+                number = field(line)
                     .and_then(|v| v.split('#').next().map(str::trim).and_then(|n| n.parse().ok()));
             }
-            if let (Some(d), Some(c), Some(k), Some(n)) =
-                (&description, channel, kind, number)
-            {
-                self.found.push(Found {
-                    channel: c,
-                    kind: k,
-                    number: n,
-                    description: d.clone(),
-                });
-                description = None;
-                number = None;
+
+            match (in_hazard, &description, channel, kind, number) {
+                (true, _, Some(c), Some(k), Some(n)) => {
+                    if !self.learned.contains(&(k, c, n)) {
+                        self.learned.push((k, c, n));
+                    }
+                    number = None;
+                }
+                (false, Some(d), Some(c), Some(k), Some(n)) => {
+                    self.found.push(Found {
+                        channel: c,
+                        kind: k,
+                        number: n,
+                        description: d.clone(),
+                    });
+                    description = None;
+                    number = None;
+                }
+                _ => {}
             }
+        }
+        if !self.learned.is_empty() {
+            println!("carried over {} known-destructive messages", self.learned.len());
         }
         if !self.found.is_empty() {
             println!("carried over {} already-described LEDs", self.found.len());

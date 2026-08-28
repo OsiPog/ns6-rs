@@ -72,9 +72,14 @@ clock and data. Sweeping arbitrary bytes therefore clocks arbitrary bits into
 that chip. A power cycle recovers it.
 
 One message is confirmed to do it: **CC 57 on channel 1**, the 58th candidate.
-The walk steps over that one rather than sending it; `NS6_LED_UNSAFE=1` sends it
-anyway. Others may well exist, so the walk saves after every description and can
-be resumed:
+Others almost certainly exist, and there is no way to predict them from the
+protocol, so the walk collects them rather than being told about them: a message
+that drops the device is written into `ns6-leds.toml` as a `[[hazard]]` and
+stepped over from then on. `NS6_LED_SKIP=255,300` rules out positions by hand,
+and `NS6_LED_UNSAFE=1` sends everything regardless.
+
+Descriptions are saved as you give them, so a crash costs nothing already
+recorded, and the walk resumes:
 
 ```sh
 NS6_LED_START=58 ns6 leds
