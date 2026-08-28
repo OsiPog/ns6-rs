@@ -31,6 +31,7 @@ fn usage() -> ! {
              ns6 [run]     bridge the controller to an ALSA MIDI port (default)\n    \
              ns6 led       light the controller's buttons, to check LED output\n    \
              ns6 leds      walk the LED space and record what each note lights\n    \
+             ns6 jog       measure how many ticks a platter reports per turn\n    \
              ns6 probe     report device state and sweep bulk OUT configurations\n    \
              ns6 learn     watch the control surface: move a control, see its MIDI\n    \
              ns6 map       move a control, say what it was; writes ns6-surface.toml\n    \
@@ -49,6 +50,7 @@ fn main() {
         "map" => cmd_run(Mode::Map),
         "led" => cmd_led(),
         "leds" => cmd_leds(),
+        "jog" => cmd_jog(),
         "probe" => cmd_probe(),
         "test" => cmd_test(),
         "-h" | "--help" | "help" => usage(),
@@ -899,5 +901,116 @@ fn cmd_leds() -> Result<(), Box<dyn std::error::Error>> {
         Ok(()) => println!("\n\nwrote {} LEDs to {}", walk.found.len(), path.display()),
         Err(e) => eprintln!("\ncould not write {}: {e}", path.display()),
     }
+    Ok(())
+}
+
+/// Measure the platter's resolution.
+///
+/// The platter reports 14-bit absolute position that wraps, so a mapping has to
+/// know how many ticks make one revolution before it can turn movement into
+/// scratching at the right speed. That number is not in the descriptors or the
+/// vendor driver; it has to come off the hardware.
+fn cmd_jog() -> Result<(), Box<dyn std::error::Error>> {
+    let dev = Arc::new(Ns6::open()?);
+    dev.start()?;
+    install_signal_handler();
+
+    let _audio_in = unsafe {
+        iso::BulkInStream::start(dev.raw_handle(), p::EP_PCM_IN, p::AUDIO_IN_XFER, 7, false)
+    }
+    .map_err(|e| format!("audio in queue: libusb error {e}"))?;
+    let _midi_in =
+        unsafe { iso::BulkInStream::start(dev.raw_handle(), p::EP_MIDI_IN, p::BLOCK, 5, true) }
+            .map_err(|e| format!("MIDI in queue: libusb error {e}"))?;
+    let _iso_in = unsafe {
+        iso::IsoStream::start(dev.raw_handle(), p::EP_ISO_IN, p::ISO_IN_PACKET, 5, 9, None)
+    }
+    .map_err(|e| format!("iso IN stream: libusb error {e}"))?;
+    let _iso_out = unsafe {
+        iso::IsoStream::start(
+            dev.raw_handle(),
+            p::EP_ISO_OUT,
+            p::ISO_OUT_PACKET,
+            40,
+            3,
+            Some((p::OUT_FRAME_BYTES, p::SAMPLE_RATE as u64)),
+        )
+    }
+    .map_err(|e| format!("iso OUT stream: libusb error {e}"))?;
+    let alive = Arc::new(AtomicBool::new(true));
+    let pump = thread::spawn({
+        let alive = alive.clone();
+        move || {
+            while alive.load(Ordering::Relaxed) {
+                iso::pump_events();
+            }
+        }
+    });
+
+    println!(
+        "\nPut a mark on one platter and turn it slowly through exactly one full\n\
+         revolution, then stop. Ctrl-C to finish.\n\n\
+         Turning it several times and dividing is more accurate than one turn.\n"
+    );
+
+    let mut surface = learn::Surface::new();
+    // Per (channel, msb) accumulated travel and last raw position.
+    let mut msb: std::collections::BTreeMap<u8, u8> = Default::default();
+    let mut last: std::collections::BTreeMap<u8, i32> = Default::default();
+    let mut travel: std::collections::BTreeMap<u8, i64> = Default::default();
+    let mut last_report = Instant::now();
+
+    while running() {
+        if let Ok(mut q) = iso::MIDI_IN.lock() {
+            if !q.is_empty() {
+                for c in surface.feed(&q) {
+                    if c.kind != learn::Kind::Cc {
+                        continue;
+                    }
+                    match c.number {
+                        0 => {
+                            msb.insert(c.channel, c.last);
+                        }
+                        32 => {
+                            let hi = msb.get(&c.channel).copied().unwrap_or(0) as i32;
+                            let position = (hi << 7) | c.last as i32;
+                            if let Some(prev) = last.insert(c.channel, position) {
+                                // Shortest way round a 14-bit circle.
+                                let mut d = position - prev;
+                                if d > 8192 {
+                                    d -= 16384;
+                                } else if d < -8192 {
+                                    d += 16384;
+                                }
+                                *travel.entry(c.channel).or_insert(0) += d.abs() as i64;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                q.clear();
+            }
+        }
+        if last_report.elapsed() >= Duration::from_millis(250) && !travel.is_empty() {
+            last_report = Instant::now();
+            let line: Vec<String> = travel
+                .iter()
+                .map(|(ch, t)| format!("deck {}: {t} ticks", ch))
+                .collect();
+            print!("\r\x1b[K  {}", line.join("   "));
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    println!("\n");
+    for (ch, t) in &travel {
+        println!("  deck {ch}: {t} ticks travelled");
+        for turns in 1..=4 {
+            println!("      if that was {turns} turn(s): {} ticks per revolution", t / turns);
+        }
+    }
+    alive.store(false, Ordering::Relaxed);
+    let _ = pump.join();
     Ok(())
 }
