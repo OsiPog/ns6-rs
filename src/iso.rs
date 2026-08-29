@@ -79,6 +79,17 @@ const LIBUSB_TRANSFER_TYPE_ISOCHRONOUS: u8 = 1;
 const LIBUSB_TRANSFER_TYPE_BULK: u8 = 2;
 const LIBUSB_TRANSFER_COMPLETED: c_int = 0;
 const LIBUSB_TRANSFER_CANCELLED: c_int = 3;
+/// The device has gone: unplugged, power-cycled, or otherwise off the bus.
+/// Every handle we hold is dead and no amount of resubmitting brings it back.
+const LIBUSB_TRANSFER_NO_DEVICE: c_int = 5;
+
+/// Set when a transfer reports the device has vanished.
+///
+/// Without this the driver carries on happily with dead pipes: the counters
+/// freeze, the ALSA port stays published, and anything reading it - Mixxx, a
+/// capture - waits forever for events that can no longer arrive. Far better to
+/// exit and let whoever started us start us again.
+pub static DEVICE_GONE: AtomicBool = AtomicBool::new(false);
 
 /// One submitted isochronous transfer, together with the buffer it points at.
 struct IsoTransfer {
@@ -303,6 +314,10 @@ extern "system" fn on_bulk_in(xfer: *mut ffi::libusb_transfer) {
             // transfer the device wants to send.
             BULK_IN_ERR.fetch_add(1, Ordering::Relaxed);
             LAST_BULK_STATUS.store(t.status as u64, Ordering::Relaxed);
+            if t.status == LIBUSB_TRANSFER_NO_DEVICE {
+                DEVICE_GONE.store(true, Ordering::Relaxed);
+                return;
+            }
         }
         if t.status == LIBUSB_TRANSFER_COMPLETED && t.actual_length > 0 {
             BULK_IN_OK.fetch_add(1, Ordering::Relaxed);

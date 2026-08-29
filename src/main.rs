@@ -235,6 +235,7 @@ fn cmd_run(mode: Mode) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let mut feedback = Vec::new();
+    let mut gone = false;
     let mut last_beat = Instant::now();
     let mut warned = false;
     let mut surface = learn::Surface::new();
@@ -290,6 +291,16 @@ fn cmd_run(mode: Mode) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     while running() {
+        if iso::DEVICE_GONE.load(Ordering::Relaxed) {
+            eprintln!(
+                "\nthe device has gone off the USB bus - power cycled, unplugged, or\n\
+                 switched off. Exiting so it can be started again against the new\n\
+                 handle; the old one is dead and would silently deliver nothing."
+            );
+            gone = true;
+            break;
+        }
+
         // Surface events from the device -> ALSA.
         if let Ok(mut q) = iso::MIDI_IN.lock() {
             if !q.is_empty() {
@@ -405,6 +416,10 @@ fn cmd_run(mode: Mode) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("\nshutting down");
+    if gone {
+        // Non-zero so systemd's Restart=on-failure picks the device up again.
+        std::process::exit(1);
+    }
     alive.store(false, Ordering::Relaxed);
     iso::ISO_RUNNING.store(false, Ordering::Relaxed);
     let _ = pump.join();
@@ -590,9 +605,12 @@ fn cmd_test() -> Result<(), Box<dyn std::error::Error>> {
 /// this is also a way to read the LED map off the hardware: it walks every note
 /// on every channel and you watch what comes on.
 ///
-///     ns6 led                 light everything at once, then clear
-///     ns6 led sweep           walk note by note, to read the LED map off
-///     ns6 led 1 0x11 127      one message: channel, note, velocity
+///     ns6 led                     light everything at once, then clear
+///     ns6 led sweep               walk note by note, to read the LED map off
+///     ns6 led 1 0x11 127          one note: channel, number, velocity
+///     ns6 led cc 0 0x31 127       one control change instead
+///     ns6 led cc 0                every control change on channel 1 at once
+///     ns6 led cc                  every control change on every channel
 fn cmd_led() -> Result<(), Box<dyn std::error::Error>> {
     let (dev, _streams) = open_for_output()?;
     install_signal_handler();
@@ -607,15 +625,33 @@ fn cmd_led() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    if args.len() == 3 {
-        let (ch, note, vel) = (
-            parse(&args[0]).unwrap_or(0),
-            parse(&args[1]).unwrap_or(0),
-            parse(&args[2]).unwrap_or(0),
+    // An optional leading "cc" or "note" picks the message type; LEDs on this
+    // device are control change, so being able to send either matters.
+    let (kind, kind_name, rest): (u8, &str, &[String]) =
+        match args.first().map(String::as_str) {
+            Some("cc") => (0xB0, "CC", &args[1..]),
+            Some("note") => (0x90, "note", &args[1..]),
+            _ => (0x90, "note", &args[..]),
+        };
+
+    if rest.len() == 3 {
+        let (ch, num, val) = (
+            parse(&rest[0]).unwrap_or(0),
+            parse(&rest[1]).unwrap_or(0),
+            parse(&rest[2]).unwrap_or(0),
         );
-        println!("note on: channel {ch} note 0x{note:02X} velocity {vel}");
-        dev.write_midi(&[0x90 | (ch & 0x0F), note, vel])?;
-        thread::sleep(Duration::from_secs(3));
+        let hold = Duration::from_secs(
+            std::env::var("NS6_LED_HOLD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(5),
+        );
+        println!(
+            "channel {ch} {kind_name} 0x{num:02X} ({num}) value {val} - holding {}s",
+            hold.as_secs()
+        );
+        dev.write_midi(&[kind | (ch & 0x0F), num, val])?;
+        thread::sleep(hold);
     } else if args.first().map(String::as_str) == Some("sweep") {
         println!(
             "Walking every note on channels 1-5. Each lights for a moment, then\n\
@@ -635,15 +671,43 @@ fn cmd_led() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!();
     } else {
-        // Everything at once: the quickest way to see whether LED output works
-        // at all, and which channels reach which half of the panel.
-        println!("lighting every note on channels 1-5 for 6 seconds...");
-        for ch in 0..5u8 {
-            for note in 0..0x60u8 {
-                dev.write_midi(&[0x90 | ch, note, 0x7F])?;
+        // Everything of one kind at once. Blunt, but it answers "can this light
+        // be driven at all" in a single look at the panel, which a walk of
+        // several hundred candidates does not.
+        let hold = Duration::from_secs(
+            std::env::var("NS6_LED_HOLD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8),
+        );
+        let channels: Vec<u8> = match rest.first().and_then(parse) {
+            Some(ch) => vec![ch],
+            None => (0..5u8).collect(),
+        };
+        println!(
+            "lighting every {kind_name} on channel(s) {} for {}s...",
+            channels
+                .iter()
+                .map(|c| (c + 1).to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            hold.as_secs()
+        );
+        let mut skipped = 0;
+        for &ch in &channels {
+            for num in 0..0x80u8 {
+                // Never send a message known to drop the device off the bus.
+                if ledmap::HAZARDS.contains(&(kind, ch, num)) {
+                    skipped += 1;
+                    continue;
+                }
+                dev.write_midi(&[kind | ch, num, 0x7F])?;
             }
         }
-        thread::sleep(Duration::from_secs(6));
+        if skipped > 0 {
+            println!("  ({skipped} known-destructive message(s) skipped)");
+        }
+        thread::sleep(hold);
     }
 
     // Leave nothing lit.
