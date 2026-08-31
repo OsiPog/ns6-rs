@@ -898,9 +898,11 @@ fn displays_to_toml(found: &[Display]) -> String {
          # could not see them: it sends one message at a time, and one message to a\n\
          # bar or a ring lights a single segment.\n\
          #\n\
-         # `value` is a position, not a brightness or a level: it picks which\n\
-         # segment lights. 127 is out of range on every one of these, which is why\n\
-         # a sweep at 127 found none of them.\n",
+         # `value` is not a brightness. What it means differs per display and has\n\
+         # to be recorded, not assumed: the FX rings and the Serato bar light the\n\
+         # single LED at position `value`, while the strip search fills `value` of\n\
+         # its fifteen. Either way 127 is out of range, which is why a sweep at 127\n\
+         # found none of them.\n",
     );
     for d in found {
         let numbers = d
