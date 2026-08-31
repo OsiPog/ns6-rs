@@ -113,6 +113,14 @@ It pairs up the MSB and LSB halves of a 14-bit control on its own, so a fader
 comes back as one entry with two messages. Enter alone throws a reading away if
 something else got caught in it, and `q` writes `ns6-surface.toml`.
 
+A run picks up where the last one left off. Anything already in
+`ns6-surface.toml` is carried over and its messages claimed, so moving a control
+that is already named does nothing and only what is still missing gets asked
+about. That is what the end of a recording session actually looks like: a
+handful of stragglers, usually the ones that needed a hardware switch set
+somewhere else first. Without it, collecting six more meant naming the other
+hundred again.
+
 Two things keep the readings clean. It spends a few seconds at startup watching
 an untouched panel, so anything that chatters on its own - the platter sensors
 do, constantly - is kept out of later readings unless it is what dominated

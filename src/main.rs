@@ -274,11 +274,15 @@ fn cmd_run(mode: Mode) -> Result<(), Box<dyn std::error::Error>> {
             "{}\n\n\
              Move a control, then tell me what it was. Repeat for as many as you\n\
              like; Enter alone throws a reading away so you can try again, and\n\
-             `q` finishes and writes ns6-surface.toml.\n\n\
+             `q` finishes and writes {SURFACE_MAP}. Anything already in that\n\
+             file is carried over and not asked about again, so a second run\n\
+             only picks up what is still missing.\n\n\
              Ready - move something.",
             seen.lines().next().unwrap_or("0 controls seen")
         );
-        recorder = Some(learn::Recorder::new(&surface));
+        let mut r = learn::Recorder::new(&surface);
+        r.load(std::path::Path::new(SURFACE_MAP));
+        recorder = Some(r);
         thread::spawn(move || {
             let mut line = String::new();
             while std::io::stdin().read_line(&mut line).unwrap_or(0) > 0 {
@@ -398,7 +402,7 @@ fn cmd_run(mode: Mode) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some(r) = recorder.as_ref() {
-        let path = std::path::Path::new("ns6-surface.toml");
+        let path = std::path::Path::new(SURFACE_MAP);
         match std::fs::write(path, r.to_toml()) {
             Ok(()) => println!("\nwrote {} controls to {}", r.entries.len(), path.display()),
             Err(e) => eprintln!("\ncould not write {}: {e}", path.display()),
@@ -792,6 +796,7 @@ impl Drop for Streams {
 /// Enter interrupts, which is when the typing starts.
 /// Where the LED map is read back from and written to.
 const LED_MAP: &str = "ns6-leds.toml";
+const SURFACE_MAP: &str = "ns6-surface.toml";
 
 fn cmd_leds() -> Result<(), Box<dyn std::error::Error>> {
     let (dev, _streams) = open_for_output()?;
