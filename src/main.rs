@@ -618,10 +618,13 @@ fn cmd_test() -> Result<(), Box<dyn std::error::Error>> {
 ///     ns6 led cc 0                every control change on channel 1 at once
 ///     ns6 led cc                  every control change on every channel
 fn cmd_led() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    if args.first().map(String::as_str) == Some("seq") {
+        return cmd_seq(&args[1..]);
+    }
+
     let (dev, _streams) = open_for_output()?;
     install_signal_handler();
-
-    let args: Vec<String> = std::env::args().skip(2).collect();
     let parse = |s: &String| -> Option<u8> {
         let s = s.trim();
         if let Some(hex) = s.strip_prefix("0x") {
@@ -790,6 +793,75 @@ fn cmd_led() -> Result<(), Box<dyn std::error::Error>> {
         let _ = dev.write_midi(&[msg[0], msg[1], 0x00]);
     }
 
+    Ok(())
+}
+
+/// One number, several values in turn, holding each.
+///
+/// Comparing values on the same display is otherwise four separate runs with a
+/// device open and a clear between each, which puts the display dark for longer
+/// than it is lit and makes the order hard to follow. Here they follow each other
+/// directly, in one session.
+///
+///     ns6 led seq cc 2:58=21,53,85,117
+///
+/// `NS6_LED_STEP` sets the milliseconds per value, default 2000.
+fn cmd_seq(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (kind, kind_name, rest): (u8, &str, &[String]) = match args.first().map(String::as_str) {
+        Some("note") => (0x90, "note", &args[1..]),
+        Some("cc") => (0xB0, "CC", &args[1..]),
+        _ => (0xB0, "CC", args),
+    };
+    let spec = rest
+        .first()
+        .ok_or("usage: ns6 led seq cc <channel>:<number>=<v1,v2,...>")?;
+    let (target, values) = spec
+        .split_once('=')
+        .ok_or("no values: expected <channel>:<number>=<v1,v2,...>")?;
+    let (ch_s, num_s) = target
+        .split_once(':')
+        .ok_or("expected <channel>:<number>=<v1,v2,...>")?;
+    let midi_ch: u8 = ch_s.trim().parse().map_err(|_| "bad channel")?;
+    let ch = midi_ch.saturating_sub(1) & 0x0F;
+    let number: u8 = num_s.trim().parse().map_err(|_| "bad number")?;
+    let values: Vec<u8> = values
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .collect();
+    if values.is_empty() {
+        return Err("no values could be read".into());
+    }
+    if ledmap::is_hazard_number(kind, number) && std::env::var("NS6_LED_UNSAFE").is_err() {
+        return Err(format!(
+            "{kind_name} {number} takes the device off the bus. NS6_LED_UNSAFE=1 sends it anyway."
+        )
+        .into());
+    }
+
+    let step = Duration::from_millis(
+        std::env::var("NS6_LED_STEP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2000),
+    );
+
+    let (dev, _streams) = open_for_output()?;
+    install_signal_handler();
+
+    println!(
+        "channel {midi_ch} {kind_name} {number}, {} values, {} ms each:\n",
+        values.len(),
+        step.as_millis()
+    );
+    for (i, &v) in values.iter().enumerate() {
+        if !running() {
+            break;
+        }
+        println!("  [{}/{}] value {v}", i + 1, values.len());
+        dev.write_midi(&[kind | ch, number, v])?;
+        thread::sleep(step);
+    }
+    let _ = dev.write_midi(&[kind | ch, number, 0x00]);
     Ok(())
 }
 
@@ -1477,8 +1549,17 @@ fn cmd_blocks(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     let block = &blocks[index];
                     let numbers: Vec<u8> = block.iter().map(|&(_, n)| n).collect();
+                    // The value is part of the key. It was not, and that lost
+                    // work: the platter ring shows four colours on one number,
+                    // and describing the second overwrote the first because both
+                    // were "CC 58 on channel 2". A number whose value means
+                    // something needs a description per value, which is the
+                    // whole point of these entries.
                     found.retain(|d| {
-                        !(d.channel == ch && d.kind == block[0].0 && d.numbers == numbers)
+                        !(d.channel == ch
+                            && d.kind == block[0].0
+                            && d.numbers == numbers
+                            && d.value == value as u8)
                     });
                     found.push(Display {
                         channel: ch,
