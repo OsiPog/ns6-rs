@@ -31,7 +31,7 @@ fn usage() -> ! {
              ns6 [run]     bridge the controller to an ALSA MIDI port (default)\n    \
              ns6 led       light specific LEDs; `led cc 1:17=127 1:40` holds several\n    \
              ns6 leds      walk the LED space and record what each note lights\n    \
-             ns6 bars      hunt the level displays: ramps values, sweeps 16 channels\n    \
+             ns6 bars      hunt the level displays; `bars step 1` drives one by hand\n    \
              ns6 jog       measure how many ticks a platter reports per turn\n    \
              ns6 probe     report device state and sweep bulk OUT configurations\n    \
              ns6 learn     watch the control surface: move a control, see its MIDI\n    \
@@ -866,6 +866,114 @@ impl Drop for Streams {
 /// Where the LED map is read back from and written to.
 const LED_MAP: &str = "ns6-leds.toml";
 const SURFACE_MAP: &str = "ns6-surface.toml";
+/// Where the multi-segment displays are recorded. Separate from the LED map
+/// because the entries are a different shape: a *range* of numbers driven
+/// together at a *value*, rather than one message that turns one lamp on.
+const DISPLAY_MAP: &str = "ns6-displays.toml";
+
+/// One described display: the numbers that drive it, held at the value that
+/// showed it.
+///
+/// The numbers are stored out in full rather than as a first..last range. A
+/// block is eight *unaccounted* numbers, and the accounted-for ones are skipped
+/// in between, so the eight are sparse - the first block on channel 1 is
+/// 0, 1, 2, 6, 19, 20, 29, 30. Written as a range that reads as 0..30, which is
+/// thirty-one numbers, twenty-three of which were never sent. The file is the
+/// only record of a session at the panel, and it has to be replayable.
+struct Display {
+    channel: u8,
+    kind: u8,
+    numbers: Vec<u8>,
+    value: u8,
+    description: String,
+}
+
+fn displays_to_toml(found: &[Display]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::from(
+        "# Numark NS6 multi-segment displays, recorded with `ns6 bars blocks`.\n\
+         # Send every number in `numbers` at `value` to show what is described.\n\
+         #\n\
+         # These are not in ns6-leds.toml because the walk that produced that file\n\
+         # could not see them: it sends one message at a time, and one message to a\n\
+         # bar or a ring lights a single segment.\n\
+         #\n\
+         # `value` is a position, not a brightness or a level: it picks which\n\
+         # segment lights. 127 is out of range on every one of these, which is why\n\
+         # a sweep at 127 found none of them.\n",
+    );
+    for d in found {
+        let numbers = d
+            .numbers
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = write!(
+            s,
+            "\n[[display]]\ndescription = \"{}\"\nchannel = {}\nkind = \"{}\"\nnumbers = [{}]\nvalue = {}\n",
+            learn::escape(&d.description),
+            d.channel,
+            if d.kind == 0xB0 { "cc" } else { "note" },
+            numbers,
+            d.value
+        );
+    }
+    s
+}
+
+fn displays_load(path: &std::path::Path) -> Vec<Display> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let (mut desc, mut ch, mut kind, mut value) = (None, None, None, None);
+    let mut numbers: Option<Vec<u8>> = None;
+    let field = |l: &str| l.split('=').nth(1).map(|v| v.trim().to_string());
+    let numeric = |v: Option<String>| -> Option<u8> {
+        v.and_then(|v| v.split('#').next().map(str::trim).and_then(|n| n.parse().ok()))
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with("[[display]]") {
+            desc = None;
+            ch = None;
+            kind = None;
+            numbers = None;
+            value = None;
+        } else if line.starts_with("description") {
+            desc = field(line).map(|v| learn::unescape(&v));
+        } else if line.starts_with("channel") {
+            ch = numeric(field(line));
+        } else if line.starts_with("kind") {
+            kind = field(line).map(|v| if v.contains("cc") { 0xB0u8 } else { 0x90 });
+        } else if line.starts_with("numbers") {
+            numbers = field(line).map(|v| {
+                v.trim_matches(|c| c == '[' || c == ']')
+                    .split(',')
+                    .filter_map(|n| n.trim().parse::<u8>().ok())
+                    .collect()
+            });
+        } else if line.starts_with("value") {
+            value = numeric(field(line));
+        }
+        if let (Some(d), Some(c), Some(k), Some(n), Some(v)) = (&desc, ch, kind, &numbers, value) {
+            out.push(Display {
+                channel: c,
+                kind: k,
+                numbers: n.clone(),
+                value: v,
+                description: d.clone(),
+            });
+            desc = None;
+            value = None;
+        }
+    }
+    if !out.is_empty() {
+        println!("carried over {} already-described displays", out.len());
+    }
+    out
+}
 
 /// Hunt for the panel's *level* displays - the FX PARAM rings, the strip search
 /// bars, the Serato strip, the MASTER meter.
@@ -889,10 +997,17 @@ const SURFACE_MAP: &str = "ns6-surface.toml";
 /// out of the corner of an eye; a plain lamp just blinks once at its threshold.
 /// That difference is the whole point.
 fn cmd_bars() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    if args.first().map(String::as_str) == Some("blocks") {
+        return cmd_blocks(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("step") {
+        return cmd_step(&args[1..]);
+    }
+
     let (dev, _streams) = open_for_output()?;
     install_signal_handler();
 
-    let args: Vec<String> = std::env::args().skip(2).collect();
     let kind = args.first().map(String::as_str).unwrap_or("pb");
 
     // Channels to try, as MIDI channels 1-16. `6-16` covers exactly the space
@@ -1074,6 +1189,325 @@ fn cmd_bars() -> Result<(), Box<dyn std::error::Error>> {
         let _ = dev.write_midi(&batch);
     }
 
+    Ok(())
+}
+
+/// Every message on `ch` that the recorded map does not account for.
+///
+/// Numbers already known to light something are left out, and by number on every
+/// channel rather than only the one they were recorded from: the panel-wide
+/// lights answer anywhere, so excluding them per channel would put a hundred lit
+/// lamps next to the one thing being looked for.
+fn unaccounted(ch: u8) -> Vec<(u8, u8)> {
+    let mut map = ledmap::LedWalk::new(16, &[0xB0, 0x90], 0x80);
+    map.load(std::path::Path::new(LED_MAP));
+    let mut known: Vec<(u8, u8)> = map.found.iter().map(|f| (f.kind, f.number)).collect();
+    known.sort_unstable();
+    known.dedup();
+
+    let unsafe_ok = std::env::var("NS6_LED_UNSAFE").is_ok();
+    let mut out = Vec::new();
+    for status in [0xB0u8, 0x90] {
+        for n in 0..0x80u8 {
+            if ledmap::HAZARDS.contains(&(status, ch, n)) && !unsafe_ok {
+                continue;
+            }
+            if known.contains(&(status, n)) {
+                continue;
+            }
+            out.push((status, n));
+        }
+    }
+    out
+}
+
+/// Drive the unaccounted numbers on one channel and move the *value* by hand.
+///
+/// A ramp proved these displays read their value as a level, and then proved
+/// itself useless for reading the mapping off: it went past too quickly to see
+/// which value did what, and value 127 - the one the original walk used - turns
+/// out to be the one value that does nothing at all.
+///
+/// So the value stops moving on its own. Sit on one, look at the panel, step to
+/// the next.
+fn cmd_step(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let midi_ch = args
+        .first()
+        .and_then(|v| v.parse::<u8>().ok())
+        .unwrap_or(1)
+        .clamp(1, 16);
+    let ch = midi_ch - 1;
+
+    let (dev, _streams) = open_for_output()?;
+    install_signal_handler();
+    let candidates = unaccounted(ch);
+
+    println!(
+        "\nMIDI channel {midi_ch}, {} unaccounted numbers, all held at one value.\n\n    \
+         right / left   value + 1 / - 1\n    \
+         ] / [          value + 8 / - 8\n    \
+         q              stop\n\n\
+         Nothing moves unless you move it, so a level can be looked at for as long\n\
+         as it takes. Value 127 does nothing here; the interesting end is low.\n",
+        candidates.len()
+    );
+
+    let Some(_raw) = term::RawMode::enable() else {
+        return Err("ns6 bars step needs a terminal: it reads arrow keys".into());
+    };
+
+    let send = |value: u8| -> Result<(), device::Error> {
+        let mut buf: Vec<u8> = Vec::new();
+        for &(status, n) in &candidates {
+            if buf.len() + 3 > p::MIDI_OUT_PAYLOAD {
+                dev.write_midi(&buf)?;
+                buf.clear();
+            }
+            buf.extend_from_slice(&[status | ch, n, value]);
+        }
+        if !buf.is_empty() {
+            dev.write_midi(&buf)?;
+        }
+        Ok(())
+    };
+
+    let mut value: i32 = 0;
+    let mut shown: Option<u8> = None;
+    let dwell = Duration::from_millis(90);
+    let mut last = Instant::now() - dwell;
+
+    send(0)?;
+    print!("  value {value:>3}");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+
+    while running() {
+        let pending = term::drain();
+        if pending.chars.iter().any(|c| *c == 'q' || *c == 'Q') {
+            break;
+        }
+        let mut delta = 0i32;
+        for c in &pending.chars {
+            match c {
+                ']' => delta += 8,
+                '[' => delta -= 8,
+                _ => {}
+            }
+        }
+        if let Some(arrow) = pending.arrow {
+            delta += if arrow == term::Key::Right { 1 } else { -1 };
+        }
+        if delta != 0 && last.elapsed() >= dwell {
+            last = Instant::now();
+            value = (value + delta).clamp(0, 127);
+            send(value as u8)?;
+            shown = Some(value as u8);
+            print!("\r\x1b[K  value {value:>3}");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    if shown.is_some() {
+        let _ = send(0);
+    }
+    println!();
+    Ok(())
+}
+
+/// The unaccounted numbers, walked in *blocks* rather than one at a time.
+///
+/// This exists because of how the first LED map went wrong. `ns6 leds` sends one
+/// message and asks what lit, which is exactly right for a button and exactly
+/// wrong for everything else on this panel. A bar, a ring, a meter is many LEDs
+/// with a number each, so the honest answer to "what did CC 96 light?" is *one
+/// segment* - a single dim LED somewhere among a hundred candidates, easy to miss
+/// and easier to dismiss while you are busy naming buttons. Every multi-segment
+/// display on the NS6 was invisible to that method, and stayed unmapped for it.
+///
+/// Lighting a run of consecutive numbers together turns the same hardware into
+/// something nobody could miss: a filled arc, a lit bar. Then the range is
+/// narrowed by halving the block.
+fn cmd_blocks(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let num = |i: usize, default: usize| -> usize {
+        args.get(i).and_then(|v| v.parse().ok()).unwrap_or(default)
+    };
+    let midi_ch = num(0, 1).clamp(1, 16) as u8;
+    let size = num(1, 8).max(1);
+    // An optional `96-110`, to walk one region closely. Each of these displays
+    // looks like a single number whose value is a position, so the useful shape
+    // is a wide first pass to find the region and then size 1 across it.
+    let (lo, hi) = match args.get(2).and_then(|a| a.split_once('-')) {
+        Some((a, b)) => (
+            a.trim().parse::<u8>().unwrap_or(0),
+            b.trim().parse::<u8>().unwrap_or(127),
+        ),
+        None => (0, 127),
+    };
+    let mut value: i32 = std::env::var("NS6_BARS_VALUE")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(5);
+    let ch = midi_ch - 1;
+
+    let (dev, _streams) = open_for_output()?;
+    install_signal_handler();
+
+    // Blocked per status, not across both: a block that straddled the control
+    // change / note boundary would be labelled with only one of them, and the
+    // label is the entire output of this walk.
+    let candidates: Vec<(u8, u8)> = unaccounted(ch)
+        .into_iter()
+        .filter(|&(_, n)| n >= lo && n <= hi)
+        .collect();
+    if candidates.is_empty() {
+        return Err(format!(
+            "nothing unaccounted for on channel {midi_ch} in {lo}..{hi}"
+        )
+        .into());
+    }
+    let mut blocks: Vec<Vec<(u8, u8)>> = Vec::new();
+    for status in [0xB0u8, 0x90] {
+        let of_kind: Vec<(u8, u8)> = candidates.iter().copied().filter(|c| c.0 == status).collect();
+        blocks.extend(of_kind.chunks(size).map(<[(u8, u8)]>::to_vec));
+    }
+
+    let mut found = displays_load(std::path::Path::new(DISPLAY_MAP));
+    println!(
+        "\nMIDI channel {midi_ch}, numbers {lo}..{hi}: {} unaccounted, in {} blocks of {size}.\n\n    \
+         right / left   next block / back\n    \
+         ] / [          value + 1 / - 1, to find a level that shows\n    \
+         Enter          describe what is lit; it is saved at once\n    \
+         q              stop\n\n\
+         A button gives one lamp. A bar, ring or meter gives a run of them - that\n\
+         is the thing to watch for, and what the one-at-a-time walk could not show.\n\
+         The value is a *position*, not a level: it picks which segment lights, so\n\
+         ] and [ walk the lit LED along the display. Value starts at {value};\n\
+         127 is out of range and shows nothing, which is why the original walk\n\
+         missed every one of these.\n",
+        candidates.len(),
+        blocks.len()
+    );
+
+    let Some(_raw) = term::RawMode::enable() else {
+        return Err("ns6 bars blocks needs a terminal: it reads arrow keys".into());
+    };
+
+    let send = |block: &[(u8, u8)], level: u8| -> Result<(), device::Error> {
+        let mut buf: Vec<u8> = Vec::new();
+        for &(status, n) in block {
+            if buf.len() + 3 > p::MIDI_OUT_PAYLOAD {
+                dev.write_midi(&buf)?;
+                buf.clear();
+            }
+            buf.extend_from_slice(&[status | ch, n, level]);
+        }
+        if !buf.is_empty() {
+            dev.write_midi(&buf)?;
+        }
+        Ok(())
+    };
+
+    let label = |i: usize, value: i32| {
+        let block: &Vec<(u8, u8)> = &blocks[i];
+        format!(
+            "[{}/{}] {} {}  value {}",
+            i + 1,
+            blocks.len(),
+            if block[0].0 == 0xB0 { "CC" } else { "note" },
+            block
+                .iter()
+                .map(|&(_, n)| n.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            value
+        )
+    };
+
+    let dwell = Duration::from_millis(150);
+    let mut last_step = Instant::now() - dwell;
+    let mut index: usize = 0;
+    let mut shown: Option<usize> = None;
+
+    while running() {
+        let pending = term::drain();
+        if pending.chars.iter().any(|c| *c == 'q' || *c == 'Q') {
+            break;
+        }
+        let mut level_delta = 0i32;
+        for c in &pending.chars {
+            match c {
+                ']' => level_delta += 1,
+                '[' => level_delta -= 1,
+                _ => {}
+            }
+        }
+
+        if (pending.arrow.is_some() || level_delta != 0) && last_step.elapsed() >= dwell {
+            last_step = Instant::now();
+            if let Some(i) = shown {
+                send(&blocks[i], 0)?;
+            }
+            if let Some(arrow) = pending.arrow {
+                match arrow {
+                    term::Key::Right if shown.is_some() => index = (index + 1).min(blocks.len() - 1),
+                    term::Key::Left => index = index.saturating_sub(1),
+                    _ => {}
+                }
+            }
+            value = (value + level_delta).clamp(0, 127);
+            send(&blocks[index], value as u8)?;
+            shown = Some(index);
+            print!("\r\x1b[K  {}", label(index, value));
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+
+        if pending.enter && shown.is_some() {
+            let cooked = _raw.cooked();
+            println!("\n  {}", label(index, value));
+            print!("  what is lit? ");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line).unwrap_or(0) > 0 {
+                let line = line.trim();
+                if line.is_empty() {
+                    println!("  (nothing recorded)");
+                } else {
+                    let block = &blocks[index];
+                    let numbers: Vec<u8> = block.iter().map(|&(_, n)| n).collect();
+                    found.retain(|d| {
+                        !(d.channel == ch && d.kind == block[0].0 && d.numbers == numbers)
+                    });
+                    found.push(Display {
+                        channel: ch,
+                        kind: block[0].0,
+                        numbers,
+                        value: value as u8,
+                        description: line.to_string(),
+                    });
+                    // Saved now rather than at exit: this walk can take the
+                    // device down without warning, and a description is the
+                    // expensive half of it.
+                    if let Err(e) = std::fs::write(DISPLAY_MAP, displays_to_toml(&found)) {
+                        eprintln!("  could not save: {e}");
+                    }
+                    println!("  recorded: {line}");
+                }
+            }
+            drop(cooked);
+            print!("\r\x1b[K  {}", label(index, value));
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            last_step = Instant::now();
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    if let Some(i) = shown {
+        let _ = send(&blocks[i], 0);
+    }
+    println!();
+    if !found.is_empty() {
+        println!("{} display(s) in {DISPLAY_MAP}", found.len());
+    }
     Ok(())
 }
 
@@ -1361,4 +1795,51 @@ fn cmd_jog() -> Result<(), Box<dyn std::error::Error>> {
     alive.store(false, Ordering::Relaxed);
     let _ = pump.join();
     Ok(())
+}
+
+#[cfg(test)]
+mod display_map {
+    use super::*;
+
+    /// The display map is written after every description because the walk can
+    /// take the device down mid-way, so reading it back has to be exact - it is
+    /// the only record of a session at the panel.
+    #[test]
+    fn a_written_display_map_reads_back_identically() {
+        let original = vec![
+            Display {
+                channel: 0,
+                kind: 0xB0,
+                // Sparse on purpose: this is what a block actually is.
+                numbers: vec![0, 1, 2, 6, 19, 20, 29, 30],
+                value: 5,
+                description: "serato strip, left half".into(),
+            },
+            Display {
+                channel: 1,
+                kind: 0x90,
+                numbers: vec![8],
+                value: 3,
+                description: "fx a param ring, \"outer\" arc".into(),
+            },
+        ];
+        let text = displays_to_toml(&original);
+        let path = std::env::temp_dir().join("ns6-display-map-roundtrip.toml");
+        std::fs::write(&path, &text).unwrap();
+        let back = displays_load(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(back.len(), 2, "wrong number of displays read back");
+        for (a, b) in original.iter().zip(back.iter()) {
+            assert_eq!(a.channel, b.channel);
+            assert_eq!(a.kind, b.kind);
+            // The sparse set must survive exactly. A range would not have.
+            assert_eq!(a.numbers, b.numbers);
+            assert_eq!(a.value, b.value);
+        }
+        // Descriptions carry quotes, so the escaping has to survive a round trip
+        // even though the reader is deliberately lenient about everything else.
+        assert_eq!(back[0].description, "serato strip, left half");
+        assert_eq!(displays_to_toml(&back), text);
+    }
 }
