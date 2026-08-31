@@ -688,7 +688,7 @@ fn cmd_led() -> Result<(), Box<dyn std::error::Error>> {
             hold.as_secs()
         );
         for &(ch, num, val) in &specs {
-            if ledmap::HAZARDS.contains(&(kind, ch, num)) && !unsafe_ok {
+            if ledmap::is_hazard_number(kind, num) && !unsafe_ok {
                 println!(
                     "  ch{} {kind_name} 0x{num:02X} ({num})  SKIPPED - takes the device \
                      off the bus. NS6_LED_UNSAFE=1 sends it anyway.",
@@ -709,7 +709,7 @@ fn cmd_led() -> Result<(), Box<dyn std::error::Error>> {
             parse(&rest[1]).unwrap_or(0),
             parse(&rest[2]).unwrap_or(0),
         );
-        if ledmap::HAZARDS.contains(&(kind, ch, num)) && !unsafe_ok {
+        if ledmap::is_hazard_number(kind, num) && !unsafe_ok {
             return Err(format!(
                 "channel {} {kind_name} 0x{num:02X} ({num}) takes the device off the \
                  bus and needs a power cycle. NS6_LED_UNSAFE=1 sends it anyway.",
@@ -738,7 +738,7 @@ fn cmd_led() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 print!("\r  channel {} note 0x{note:02X}   ", ch + 1);
                 let _ = std::io::Write::flush(&mut std::io::stdout());
-                if ledmap::HAZARDS.contains(&(0x90, ch, note)) && !unsafe_ok {
+                if ledmap::is_hazard_number(0x90, note) && !unsafe_ok {
                     continue;
                 }
                 dev.write_midi(&[0x90 | ch, note, 0x7F])?;
@@ -769,7 +769,7 @@ fn cmd_led() -> Result<(), Box<dyn std::error::Error>> {
         for &ch in &channels {
             for num in 0..0x80u8 {
                 // Never send a message known to drop the device off the bus.
-                if ledmap::HAZARDS.contains(&(kind, ch, num)) && !unsafe_ok {
+                if ledmap::is_hazard_number(kind, num) && !unsafe_ok {
                     skipped += 1;
                     continue;
                 }
@@ -1133,7 +1133,7 @@ fn cmd_bars() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     for &status in statuses {
                         for num in 0..0x80u8 {
-                            if ledmap::HAZARDS.contains(&(status, ch, num)) && !unsafe_ok {
+                            if ledmap::is_hazard_number(status, num) && !unsafe_ok {
                                 continue;
                             }
                             if kind == "unknown" && known.contains(&(status, num)) {
@@ -1192,13 +1192,14 @@ fn cmd_bars() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Every message on `ch` that the recorded map does not account for.
+/// Every message the recorded map does not account for.
 ///
-/// Numbers already known to light something are left out, and by number on every
-/// channel rather than only the one they were recorded from: the panel-wide
-/// lights answer anywhere, so excluding them per channel would put a hundred lit
-/// lamps next to the one thing being looked for.
-fn unaccounted(ch: u8) -> Vec<(u8, u8)> {
+/// Channel is not a parameter, because nothing here depends on it. Numbers known
+/// to light something are excluded on every channel, since the panel-wide lights
+/// answer anywhere and excluding them per channel would put a hundred lit lamps
+/// next to the one thing being looked for. Hazards are excluded on every channel
+/// for the harder-won reason in `ledmap::is_hazard_number`.
+fn unaccounted() -> Vec<(u8, u8)> {
     let mut map = ledmap::LedWalk::new(16, &[0xB0, 0x90], 0x80);
     map.load(std::path::Path::new(LED_MAP));
     let mut known: Vec<(u8, u8)> = map.found.iter().map(|f| (f.kind, f.number)).collect();
@@ -1209,7 +1210,7 @@ fn unaccounted(ch: u8) -> Vec<(u8, u8)> {
     let mut out = Vec::new();
     for status in [0xB0u8, 0x90] {
         for n in 0..0x80u8 {
-            if ledmap::HAZARDS.contains(&(status, ch, n)) && !unsafe_ok {
+            if ledmap::is_hazard_number(status, n) && !unsafe_ok {
                 continue;
             }
             if known.contains(&(status, n)) {
@@ -1240,7 +1241,7 @@ fn cmd_step(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     let (dev, _streams) = open_for_output()?;
     install_signal_handler();
-    let candidates = unaccounted(ch);
+    let candidates = unaccounted();
 
     println!(
         "\nMIDI channel {midi_ch}, {} unaccounted numbers, all held at one value.\n\n    \
@@ -1355,7 +1356,7 @@ fn cmd_blocks(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // Blocked per status, not across both: a block that straddled the control
     // change / note boundary would be labelled with only one of them, and the
     // label is the entire output of this walk.
-    let candidates: Vec<(u8, u8)> = unaccounted(ch)
+    let candidates: Vec<(u8, u8)> = unaccounted()
         .into_iter()
         .filter(|&(_, n)| n >= lo && n <= hi)
         .collect();

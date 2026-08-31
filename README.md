@@ -97,14 +97,25 @@ through the same pipe, using byte patterns `addr | 0x00/0x40/0x80/0xC0/0xE0` as
 clock and data. Sweeping arbitrary bytes therefore clocks arbitrary bits into
 that chip. A power cycle recovers it.
 
-Two messages are confirmed to do it: **CC 57 on channel 1**, the 58th
-candidate, and **CC 59 on channel 4**. They share neither a number nor a
-channel, so there is no pattern to extrapolate from and others almost certainly
-exist. There is no way to predict them from the protocol either, so the walk
-collects them rather than being told about them: a message
+One message is confirmed to do it: **CC 57**, which kills the device on every
+channel tried. Others may well exist and there is no way to predict them from the
+protocol, so the walk collects them rather than being told about them: a message
 that drops the device is written into `ns6-leds.toml` as a `[[hazard]]` and
 stepped over from then on. `NS6_LED_SKIP=255,300` rules out positions by hand,
 and `NS6_LED_UNSAFE=1` sends everything regardless.
+
+**Treat a collected hazard as a suspect, not a verdict.** The walk blames whichever
+candidate was lit when the device vanished, and that is a guess: CC 59 was recorded
+this way and stepped over for a long time before being sent on its own, which it
+survives on channel 2 at value 5 and on channel 4 at both 5 and 127. The walk had
+blamed the wrong candidate. A wrong entry is not free either - it removes a number
+from every later walk, which is how a real display can stay hidden - so confirm a
+suspect by sending it alone with `ns6 led` before trusting it:
+
+```sh
+NS6_LED_UNSAFE=1 ns6 led cc 4:59=127     # survives; not a hazard
+NS6_LED_UNSAFE=1 ns6 led cc 1:57=127     # takes the device off the bus
+```
 
 Descriptions are saved as you give them, so a crash costs nothing already
 recorded, and the walk resumes:
