@@ -29,7 +29,7 @@ fn usage() -> ! {
          \n\
          USAGE:\n    \
              ns6 [run]     bridge the controller to an ALSA MIDI port (default)\n    \
-             ns6 led       light the controller's buttons, to check LED output\n    \
+             ns6 led       light specific LEDs; `led cc 1:17=127 1:40` holds several\n    \
              ns6 leds      walk the LED space and record what each note lights\n    \
              ns6 jog       measure how many ticks a platter reports per turn\n    \
              ns6 probe     report device state and sweep bulk OUT configurations\n    \
@@ -629,6 +629,13 @@ fn cmd_led() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Everything sent, so the end of the command can clear exactly that. The
+    // old code cleared notes 0x00..0x60 on every channel regardless, which
+    // cleared nothing at all after a `cc` run - and LEDs on this device are
+    // control change, so that was every run that lit anything.
+    let mut lit: Vec<[u8; 3]> = Vec::new();
+    let unsafe_ok = std::env::var("NS6_LED_UNSAFE").is_ok();
+
     // An optional leading "cc" or "note" picks the message type; LEDs on this
     // device are control change, so being able to send either matters.
     let (kind, kind_name, rest): (u8, &str, &[String]) =
@@ -638,23 +645,84 @@ fn cmd_led() -> Result<(), Box<dyn std::error::Error>> {
             _ => (0x90, "note", &args[..]),
         };
 
-    if rest.len() == 3 {
+    let hold_secs = |default: u64| {
+        Duration::from_secs(
+            std::env::var("NS6_LED_HOLD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default),
+        )
+    };
+
+    if rest.iter().any(|a| a.contains(':')) {
+        // Several named messages, held together. This is the only way to ask
+        // whether two lights are independent lamps or two faces of one state:
+        // the walk in `ns6 leds` clears each candidate before sending the next,
+        // so it can never show what a combination does.
+        //
+        // Channels here are MIDI channels, 1-5, as the recorded maps write them.
+        let specs: Vec<(u8, u8, u8)> = rest
+            .iter()
+            .filter(|a| a.contains(':'))
+            .filter_map(|a| {
+                let (ch, rest) = a.split_once(':')?;
+                let (num, val) = match rest.split_once('=') {
+                    Some((n, v)) => (n, parse(&v.to_string())?),
+                    None => (rest, 0x7F),
+                };
+                let ch: u8 = parse(&ch.to_string())?;
+                Some((ch.saturating_sub(1) & 0x0F, parse(&num.to_string())?, val))
+            })
+            .collect();
+        if specs.len() != rest.iter().filter(|a| a.contains(':')).count() {
+            return Err("could not read a spec; each is channel:number[=value], \
+                        as in `ns6 led cc 1:17=127 1:40`"
+                .into());
+        }
+        let hold = hold_secs(20);
+        println!(
+            "sending {} message(s) together, holding {}s:",
+            specs.len(),
+            hold.as_secs()
+        );
+        for &(ch, num, val) in &specs {
+            if ledmap::HAZARDS.contains(&(kind, ch, num)) && !unsafe_ok {
+                println!(
+                    "  ch{} {kind_name} 0x{num:02X} ({num})  SKIPPED - takes the device \
+                     off the bus. NS6_LED_UNSAFE=1 sends it anyway.",
+                    ch + 1
+                );
+                continue;
+            }
+            println!("  ch{} {kind_name} 0x{num:02X} ({num}) = {val}", ch + 1);
+            let msg = [kind | ch, num, val];
+            dev.write_midi(&msg)?;
+            lit.push(msg);
+        }
+        println!("\nlook at the panel. Everything above is lit at once.");
+        thread::sleep(hold);
+    } else if rest.len() == 3 {
         let (ch, num, val) = (
             parse(&rest[0]).unwrap_or(0),
             parse(&rest[1]).unwrap_or(0),
             parse(&rest[2]).unwrap_or(0),
         );
-        let hold = Duration::from_secs(
-            std::env::var("NS6_LED_HOLD")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(5),
-        );
+        if ledmap::HAZARDS.contains(&(kind, ch, num)) && !unsafe_ok {
+            return Err(format!(
+                "channel {} {kind_name} 0x{num:02X} ({num}) takes the device off the \
+                 bus and needs a power cycle. NS6_LED_UNSAFE=1 sends it anyway.",
+                ch + 1
+            )
+            .into());
+        }
+        let hold = hold_secs(5);
         println!(
             "channel {ch} {kind_name} 0x{num:02X} ({num}) value {val} - holding {}s",
             hold.as_secs()
         );
-        dev.write_midi(&[kind | (ch & 0x0F), num, val])?;
+        let msg = [kind | (ch & 0x0F), num, val];
+        dev.write_midi(&msg)?;
+        lit.push(msg);
         thread::sleep(hold);
     } else if args.first().map(String::as_str) == Some("sweep") {
         println!(
@@ -668,6 +736,9 @@ fn cmd_led() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 print!("\r  channel {} note 0x{note:02X}   ", ch + 1);
                 let _ = std::io::Write::flush(&mut std::io::stdout());
+                if ledmap::HAZARDS.contains(&(0x90, ch, note)) && !unsafe_ok {
+                    continue;
+                }
                 dev.write_midi(&[0x90 | ch, note, 0x7F])?;
                 thread::sleep(Duration::from_millis(400));
                 dev.write_midi(&[0x90 | ch, note, 0x00])?;
@@ -678,12 +749,7 @@ fn cmd_led() -> Result<(), Box<dyn std::error::Error>> {
         // Everything of one kind at once. Blunt, but it answers "can this light
         // be driven at all" in a single look at the panel, which a walk of
         // several hundred candidates does not.
-        let hold = Duration::from_secs(
-            std::env::var("NS6_LED_HOLD")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(8),
-        );
+        let hold = hold_secs(8);
         let channels: Vec<u8> = match rest.first().and_then(parse) {
             Some(ch) => vec![ch],
             None => (0..5u8).collect(),
@@ -701,11 +767,13 @@ fn cmd_led() -> Result<(), Box<dyn std::error::Error>> {
         for &ch in &channels {
             for num in 0..0x80u8 {
                 // Never send a message known to drop the device off the bus.
-                if ledmap::HAZARDS.contains(&(kind, ch, num)) {
+                if ledmap::HAZARDS.contains(&(kind, ch, num)) && !unsafe_ok {
                     skipped += 1;
                     continue;
                 }
-                dev.write_midi(&[kind | ch, num, 0x7F])?;
+                let msg = [kind | ch, num, 0x7F];
+                dev.write_midi(&msg)?;
+                lit.push(msg);
             }
         }
         if skipped > 0 {
@@ -714,11 +782,10 @@ fn cmd_led() -> Result<(), Box<dyn std::error::Error>> {
         thread::sleep(hold);
     }
 
-    // Leave nothing lit.
-    for ch in 0..5u8 {
-        for note in 0..0x60u8 {
-            let _ = dev.write_midi(&[0x90 | ch, note, 0x00]);
-        }
+    // Leave nothing lit - and clear the same messages that were sent, rather
+    // than a fixed range of notes, which missed control change entirely.
+    for msg in &lit {
+        let _ = dev.write_midi(&[msg[0], msg[1], 0x00]);
     }
 
     Ok(())

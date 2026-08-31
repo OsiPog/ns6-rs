@@ -65,6 +65,26 @@ once as an output, and Mixxx pairs an input with an output by matching name.
 Two separately-named ports leave it opening only the input, so the surface works
 and the LEDs silently cannot.
 
+### Lighting specific LEDs
+
+`ns6 led` sends messages you name and holds them, which is how a question about
+one light gets answered without walking the whole space:
+
+```sh
+ns6 led cc 1:17=127            # MIDI channel 1, CC 17, value 127
+ns6 led cc 1:17 1:40           # both at once, value 127 each
+ns6 led cc 1:82=64             # some other value
+```
+
+Channels are MIDI channels, 1-5, as the recorded maps write them. Messages known
+to take the device off the bus are refused unless `NS6_LED_UNSAFE=1`, and
+`NS6_LED_HOLD` sets the seconds.
+
+Holding *several* is the part the walk below cannot do: it clears each candidate
+before sending the next, so it can show what one message lights but never what a
+combination does. That distinction is what says whether two lights are
+independent lamps or two faces of one state.
+
 ### Mapping the LEDs
 
 `ns6 leds` walks the output space so you can record what each message lights.
