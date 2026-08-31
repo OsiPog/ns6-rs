@@ -31,6 +31,7 @@ fn usage() -> ! {
              ns6 [run]     bridge the controller to an ALSA MIDI port (default)\n    \
              ns6 led       light specific LEDs; `led cc 1:17=127 1:40` holds several\n    \
              ns6 leds      walk the LED space and record what each note lights\n    \
+             ns6 bars      hunt the level displays: ramps values, sweeps 16 channels\n    \
              ns6 jog       measure how many ticks a platter reports per turn\n    \
              ns6 probe     report device state and sweep bulk OUT configurations\n    \
              ns6 learn     watch the control surface: move a control, see its MIDI\n    \
@@ -50,6 +51,7 @@ fn main() {
         "map" => cmd_run(Mode::Map),
         "led" => cmd_led(),
         "leds" => cmd_leds(),
+        "bars" => cmd_bars(),
         "jog" => cmd_jog(),
         "probe" => cmd_probe(),
         "test" => cmd_test(),
@@ -864,6 +866,216 @@ impl Drop for Streams {
 /// Where the LED map is read back from and written to.
 const LED_MAP: &str = "ns6-leds.toml";
 const SURFACE_MAP: &str = "ns6-surface.toml";
+
+/// Hunt for the panel's *level* displays - the FX PARAM rings, the strip search
+/// bars, the Serato strip, the MASTER meter.
+///
+/// `ns6 leds` cannot find these, and it is worth being precise about why, because
+/// it is not simply that it missed them. It walks control change and note on over
+/// **five** channels and sends every one at value **127**. Three assumptions are
+/// baked into that, and a bar display breaks all of them:
+///
+///   - **Five channels.** MIDI has sixteen. Channels 6-16 have never been sent
+///     anything at all.
+///   - **Control change and note on only.** A 14-bit level has an obvious
+///     carrier in MIDI - pitch bend - and it was never tried. Nor was program
+///     change.
+///   - **Value 127.** The layer indicators already proved the value can carry
+///     meaning rather than just on-ness, and for a display that reads its value
+///     as a level, one fixed value is the worst possible probe: it cannot
+///     animate, so it looks like a lamp if it responds at all.
+///
+/// So this ramps instead of holding. A level display sweeps, which is unmistakable
+/// out of the corner of an eye; a plain lamp just blinks once at its threshold.
+/// That difference is the whole point.
+fn cmd_bars() -> Result<(), Box<dyn std::error::Error>> {
+    let (dev, _streams) = open_for_output()?;
+    install_signal_handler();
+
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let kind = args.first().map(String::as_str).unwrap_or("pb");
+
+    // Channels to try, as MIDI channels 1-16. `6-16` covers exactly the space
+    // `ns6 leds` never reached.
+    let range = args.iter().find(|a| a.contains('-') || a.parse::<u8>().is_ok());
+    let (first, last) = match range.map(String::as_str) {
+        Some(spec) => match spec.split_once('-') {
+            Some((a, b)) => (
+                a.trim().parse::<u8>().unwrap_or(1).max(1),
+                b.trim().parse::<u8>().unwrap_or(16).min(16),
+            ),
+            None => {
+                let c = spec.trim().parse::<u8>().unwrap_or(1).clamp(1, 16);
+                (c, c)
+            }
+        },
+        None => (1, 16),
+    };
+
+    // Seconds each channel gets. One ramp up and back down inside it.
+    let dwell = Duration::from_millis(
+        std::env::var("NS6_BARS_DWELL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2500),
+    );
+    // Pin the value instead of ramping. This is what separates "many numbers at
+    // once" from "the animation itself": same messages, same simultaneity, no
+    // movement.
+    let fixed = std::env::var("NS6_BARS_VALUE")
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok());
+
+    let steps: u32 = std::env::var("NS6_BARS_STEPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(if kind == "pb" || kind == "pc" { 48 } else { 16 });
+    let unsafe_ok = std::env::var("NS6_LED_UNSAFE").is_ok();
+
+    println!(
+        "\nRamping {kind} over MIDI channels {first}-{last}, {} ms each.\n\n\
+         Watch for anything that *sweeps* rather than blinks: the FX PARAM rings,\n\
+         the strip search bars, the Serato strip, the MASTER meter. A lamp can only\n\
+         switch on; a level display follows the ramp, which is what gives it away.\n",
+        dwell.as_millis()
+    );
+    if kind == "cc" || kind == "note" || kind == "unknown" {
+        println!(
+            "  note: this drives every number on the channel at once, so the\n  \
+             ordinary button lights will flicker too. Ignore anything that is\n  \
+             merely on or off; only a sweep matters.\n"
+        );
+    }
+
+    // For the `unknown` mode: every message the recorded map says lights
+    // something, so those can be left alone. Driving them too would set a
+    // hundred button lights flickering and bury the one thing being hunted -
+    // which is the whole difficulty with sweeping this space at all.
+    //
+    // Channel is deliberately ignored here. The panel-wide lights answer on any
+    // channel, so a number excluded only on the channel it was recorded from
+    // would light up again the moment channels 6-16 are driven - which is most
+    // of what this is for.
+    let mut known: Vec<(u8, u8)> = Vec::new();
+    if kind == "unknown" {
+        let mut map = ledmap::LedWalk::new(16, &[0xB0, 0x90], 0x80);
+        map.load(std::path::Path::new(LED_MAP));
+        known = map.found.iter().map(|f| (f.kind, f.number)).collect();
+        known.sort_unstable();
+        known.dedup();
+        println!(
+            "  leaving {} already-described numbers alone, on every channel, so the\n  \
+             panel stays dark except for whatever answers. Any movement is a find.\n",
+            known.len()
+        );
+    }
+
+    // The pipe takes 39 bytes per write, which is thirteen three-byte messages.
+    // Driving a whole channel one transfer at a time is thirteen times the USB
+    // round trips for nothing, and slow enough to make a ramp visibly step.
+    let mut batch: Vec<u8> = Vec::new();
+
+    let mut lit: Vec<[u8; 3]> = Vec::new();
+    for midi_ch in first..=last {
+        let ch = midi_ch - 1;
+        for step in 0..=steps {
+            if !running() {
+                break;
+            }
+            // Up then back down, so a display that only moves one way still shows.
+            let phase = if step * 2 <= steps { step * 2 } else { 2 * steps - step * 2 };
+            let level7 = fixed.unwrap_or((phase * 127 / steps).min(127) as u8);
+            let level14 = match fixed {
+                Some(v) => v as u16 * 129,
+                None => (phase * 16383 / steps).min(16383) as u16,
+            };
+
+            // The value on screen, so the moment something lights can be read
+            // off rather than guessed at afterwards.
+            print!("\r\x1b[K  channel {midi_ch:>2}   value {level7:>3}");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+
+            match kind {
+                // Pitch bend carries 14 bits and has no number: one message per
+                // channel, so the whole space is 16 messages. The cheapest probe
+                // there is, and the likeliest shape for a level.
+                "pb" => {
+                    dev.write_midi(&[0xE0 | ch, (level14 & 0x7F) as u8, (level14 >> 7) as u8])?;
+                }
+                // Program change is two bytes, and a display could read the
+                // program number as a level.
+                "pc" => {
+                    dev.write_midi(&[0xC0 | ch, level7])?;
+                }
+                // Every number on the channel, ramping together.
+                _ => {
+                    let statuses: &[u8] = if kind == "note" {
+                        &[0x90]
+                    } else if kind == "unknown" {
+                        &[0xB0, 0x90]
+                    } else {
+                        &[0xB0]
+                    };
+                    for &status in statuses {
+                        for num in 0..0x80u8 {
+                            if ledmap::HAZARDS.contains(&(status, ch, num)) && !unsafe_ok {
+                                continue;
+                            }
+                            if kind == "unknown" && known.contains(&(status, num)) {
+                                continue;
+                            }
+                            let msg = [status | ch, num, level7];
+                            if batch.len() + 3 > p::MIDI_OUT_PAYLOAD {
+                                dev.write_midi(&batch)?;
+                                batch.clear();
+                            }
+                            batch.extend_from_slice(&msg);
+                            lit.push(msg);
+                        }
+                    }
+                    if !batch.is_empty() {
+                        dev.write_midi(&batch)?;
+                        batch.clear();
+                    }
+                }
+            }
+            thread::sleep(dwell / (steps + 1));
+        }
+        if !running() {
+            break;
+        }
+    }
+    println!("\r\x1b[K  done - channels {first}-{last} of {kind}.");
+
+    // Put back whatever was driven.
+    for midi_ch in first..=last {
+        let ch = midi_ch - 1;
+        match kind {
+            // Centre, not zero: zero is full deflection one way.
+            "pb" => {
+                let _ = dev.write_midi(&[0xE0 | ch, 0x00, 0x40]);
+            }
+            "pc" => {
+                let _ = dev.write_midi(&[0xC0 | ch, 0]);
+            }
+            _ => {}
+        }
+    }
+    lit.sort_unstable();
+    lit.dedup();
+    for msg in &lit {
+        if batch.len() + 3 > p::MIDI_OUT_PAYLOAD {
+            let _ = dev.write_midi(&batch);
+            batch.clear();
+        }
+        batch.extend_from_slice(&[msg[0], msg[1], 0x00]);
+    }
+    if !batch.is_empty() {
+        let _ = dev.write_midi(&batch);
+    }
+
+    Ok(())
+}
 
 fn cmd_leds() -> Result<(), Box<dyn std::error::Error>> {
     let (dev, _streams) = open_for_output()?;
