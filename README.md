@@ -77,9 +77,11 @@ through the same pipe, using byte patterns `addr | 0x00/0x40/0x80/0xC0/0xE0` as
 clock and data. Sweeping arbitrary bytes therefore clocks arbitrary bits into
 that chip. A power cycle recovers it.
 
-One message is confirmed to do it: **CC 57 on channel 1**, the 58th candidate.
-Others almost certainly exist, and there is no way to predict them from the
-protocol, so the walk collects them rather than being told about them: a message
+Two messages are confirmed to do it: **CC 57 on channel 1**, the 58th
+candidate, and **CC 59 on channel 4**. They share neither a number nor a
+channel, so there is no pattern to extrapolate from and others almost certainly
+exist. There is no way to predict them from the protocol either, so the walk
+collects them rather than being told about them: a message
 that drops the device is written into `ns6-leds.toml` as a `[[hazard]]` and
 stepped over from then on. `NS6_LED_SKIP=255,300` rules out positions by hand,
 and `NS6_LED_UNSAFE=1` sends everything regardless.

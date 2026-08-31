@@ -61,6 +61,10 @@ pub struct Found {
 pub const HAZARDS: &[(u8, u8, u8)] = &[
     // Confirmed twice: this one drops the device and needs a power cycle.
     (0xB0, 0, 57),
+    // Found by the second LED walk, the same way: the walk reached it, the
+    // device left the bus. Note it is a different number on a different
+    // channel, so the two are not one register seen twice.
+    (0xB0, 3, 59),
 ];
 
 pub struct LedWalk {
