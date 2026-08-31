@@ -460,9 +460,7 @@ fn parse_surface(text: &str) -> Vec<Entry> {
         if line.starts_with("[[control]]") {
             flush(&mut description, &mut notes, &mut keys, &mut entries);
         } else if let Some(rest) = line.strip_prefix("description") {
-            description = rest
-                .split_once('=')
-                .map(|(_, v)| v.trim().trim_matches('"').to_string());
+            description = rest.split_once('=').map(|(_, v)| unescape(v));
         } else if line.starts_with('#') && description.is_some() && notes.is_none() {
             notes = Some(line.trim_start_matches('#').trim().to_string());
         } else if line.starts_with('{') {
@@ -497,8 +495,33 @@ fn parse_message(line: &str) -> Option<Key> {
     Some((channel?, kind?, number?))
 }
 
-fn escape(s: &str) -> String {
+pub fn escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Undo [`escape`], and strip the surrounding quotes.
+///
+/// Every one of these maps is written by the tool and read back by it, so a
+/// description that survives the trip only if it contains no quotation marks is
+/// a bug waiting for the first person to write `deck a "play"`. Trimming the
+/// quotes is not enough on its own.
+pub fn unescape(s: &str) -> String {
+    let s = s.trim();
+    let s = s.strip_prefix('"').unwrap_or(s);
+    let s = s.strip_suffix('"').unwrap_or(s);
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(next) => out.push(next),
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 #[cfg(test)]

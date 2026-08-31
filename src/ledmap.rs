@@ -238,7 +238,7 @@ impl LedWalk {
                 continue;
             }
             if line.starts_with("description") {
-                description = field(line).map(|v| v.trim_matches('"').to_string());
+                description = field(line).map(|v| crate::learn::unescape(&v));
             } else if line.starts_with("channel") {
                 channel = field(line).and_then(|v| v.parse::<u8>().ok());
             } else if line.starts_with("kind") {
