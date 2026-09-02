@@ -271,3 +271,71 @@ guest's Windows driver was failing in exactly the way ours was, and its init loo
 repeating ~154 times was the symptom, not the recipe. Matching our traffic to it
 was matching a failure. The only capture in this repository that shows the device
 working is `captures/ns6.pcap`, from real hardware.
+
+## Audio in is not PCM
+
+Everything above describes what the Windows driver *does*. What the device actually
+sends on bulk IN `0x86` was measured on hardware, and it is not the 24-bit PCM the
+channel-layout arithmetic implies.
+
+The pipe delivers 5.6448 MB/s at 44.1 kHz — 21x the 264.6 kB/s that 2 channels of
+24-bit audio need. Every byte pair is `xx 00` where `xx` is `0x00` or `0x01`: one
+bit per two-byte unit, in bit 0 of the even byte, with the odd byte always zero.
+That is 2.8224 M units/s, exactly **64 x 44100**.
+
+Taking the density of bit positions modulo several candidate frame lengths settles
+the framing. At period 64, and only at period 64, eight positions are *always* zero:
+
+```
+pos  0..23   ~0.49 density   slot A data
+pos 24..31    0.00           slot A pad
+pos 32..55   ~0.50           slot B data
+pos 56..63    0.00           slot B pad
+```
+
+So the device streams its ADC's raw **I2S line**: 64 bit-clocks per audio frame, two
+32-bit slots, 24 significant bits MSB-first followed by 8 zeros. One bit per two
+bytes is a wasteful way to carry it, which is presumably why the vendor driver
+posts such enormous transfers. Decoding is in `src/audio.rs`; the pad bits are also
+what the decoder locks its bit phase onto, since there is no word clock on the wire.
+
+A 131072-byte transfer is 65536 units, which is exactly 1024 audio frames — the
+transfer size is frame-aligned, so the phase only has to be found once.
+
+## Audio out, measured
+
+Output is what `protocol.rs` always said: interleaved 24-bit little-endian, 4
+channels, 12 bytes per frame, written into the isochronous OUT packets at the frame
+counts the Bresenham pattern produces. Writing a sine into it comes out of the
+device, at the frequency asked for.
+
+The channel mapping was measured by giving each slot its own frequency
+(`NS6_TONE_SPREAD=1`) and looking at where each one landed:
+
+| Slot | Bytes | Where it comes out |
+|---|---|---|
+| 0 | 0..3 | one side of the output |
+| 1 | 3..6 | the same side as slot 0 |
+| 2 | 6..9 | the other side |
+| 3 | 9..12 | the same side as slot 2 |
+
+So the slots are grouped by **side**, not by pair: a stereo signal is (slot 0,
+slot 2) or (slot 1, slot 3), and the two pairs sum. Which analogue jack each pair
+reaches depends on the mixer's own routing, which is not on this wire.
+
+## What the input actually listens to
+
+The ADC does not hear the line inputs directly. It hears the mixer, and the mixer
+is the device's own: with nothing routed to it, bulk IN `0x86` is not noise but
+*every bit zero*. Playing audio out over USB makes it appear on the input pipe
+within the same second, so a complete loop — USB out, through the mixer, back in
+over USB — can be measured with no cables attached at all. That loop is the
+quickest way to prove both directions still work.
+
+## Give it time after a power cycle
+
+Streaming can come up perfectly — control transfers accepted, isochronous OUT with
+zero errors, bulk IN flowing at full rate — while the analogue side of the device is
+still dead, delivering digital silence in and producing nothing out. Waiting ~15 s
+after power-on before opening the device fixes it. A short wait looks exactly like a
+routing bug, and cost an hour of chasing one.

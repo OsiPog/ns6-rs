@@ -137,6 +137,11 @@ extern "system" fn on_complete(xfer: *mut ffi::libusb_transfer) {
                 let rate = OUT_RATE.load(Ordering::Relaxed);
                 if bpf > 0 && rate > 0 {
                     size_out_packets(&mut *xfer, bpf, rate);
+                    if crate::audio::PLAY_ON.load(Ordering::Relaxed) {
+                        fill_out_pcm(&mut *xfer);
+                    } else if TONE_ON.load(Ordering::Relaxed) {
+                        fill_out_tone(&mut *xfer, bpf);
+                    }
                 }
             }
             ffi::libusb_submit_transfer(xfer);
@@ -219,6 +224,9 @@ impl IsoStream {
                 // OUT packets carry only as much audio as the sample rate calls for.
                 if let Some((bytes_per_frame, rate)) = frame_pattern {
                     size_out_packets(t, bytes_per_frame, rate);
+                    if TONE_ON.load(Ordering::Relaxed) {
+                        fill_out_tone(t, bytes_per_frame);
+                    }
                 }
             }
 
@@ -323,6 +331,25 @@ extern "system" fn on_bulk_in(xfer: *mut ffi::libusb_transfer) {
             BULK_IN_OK.fetch_add(1, Ordering::Relaxed);
             BULK_IN_BYTES.fetch_add(t.actual_length as u64, Ordering::Relaxed);
 
+            if t.endpoint as u64 != MIDI_IN_EP.load(Ordering::Relaxed) {
+                if crate::audio::REC_ON.load(Ordering::Relaxed) {
+                    let data = std::slice::from_raw_parts(t.buffer, t.actual_length as usize);
+                    let mut pcm = Vec::with_capacity(data.len() / 21);
+                    if let Ok(mut a) = REC_ALIGN.lock() {
+                        crate::audio::decode_i2s(data, &mut a, &mut pcm);
+                    }
+                    crate::audio::push_rec(&pcm);
+                }
+                if let Ok(mut slot) = PCM_DUMP.lock() {
+                    if let Some(f) = slot.as_mut() {
+                        let data = std::slice::from_raw_parts(t.buffer, t.actual_length as usize);
+                        use std::io::Write;
+                        if f.write_all(data).is_ok() {
+                            PCM_DUMP_BYTES.fetch_add(t.actual_length as u64, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
             if t.endpoint as u64 == MIDI_IN_EP.load(Ordering::Relaxed) {
                 let data = std::slice::from_raw_parts(t.buffer, t.actual_length as usize);
                 let mut clean = Vec::with_capacity(data.len());
@@ -421,4 +448,101 @@ impl Drop for BulkInStream {
             }
         }
     }
+}
+
+/* --------------------------------------------------------- audio testing */
+//
+// Everything below exists to answer one question on real hardware: does the
+// isochronous OUT pipe carry audio the device actually plays, and does bulk IN
+// 0x86 carry what is plugged into the analogue inputs? Both directions are
+// silence in the bridge, so neither had ever been driven.
+
+/// Fill isochronous OUT packets with a test tone instead of silence.
+pub static TONE_ON: AtomicBool = AtomicBool::new(false);
+/// Tone frequency in Hz.
+pub static TONE_HZ: AtomicU64 = AtomicU64::new(1000);
+/// Which of the four output channels the tone is written to, one bit each.
+pub static TONE_MASK: AtomicU64 = AtomicU64::new(0xF);
+/// Amplitude in percent of full scale.
+pub static TONE_AMP: AtomicU64 = AtomicU64::new(50);
+/// Give channel `c` the frequency `TONE_HZ * (c + 1)`, so one capture shows
+/// where every output channel lands.
+pub static TONE_SPREAD: AtomicBool = AtomicBool::new(false);
+/// Sample index, so phase is continuous across transfers.
+static TONE_PHASE: AtomicU64 = AtomicU64::new(0);
+
+/// Write a 24-bit little-endian sine into every frame of a sized OUT transfer.
+///
+/// For an OUT transfer libusb reads the packets back-to-back out of the buffer
+/// at the lengths `size_out_packets` just set, so walking the descriptors with
+/// a running offset lands on the right bytes.
+unsafe fn fill_out_tone(t: &mut ffi::libusb_transfer, bytes_per_frame: usize) {
+    let rate = OUT_RATE.load(Ordering::Relaxed) as f64;
+    if rate <= 0.0 {
+        return;
+    }
+    let hz = TONE_HZ.load(Ordering::Relaxed) as f64;
+    let amp = (TONE_AMP.load(Ordering::Relaxed) as f64 / 100.0).clamp(0.0, 1.0);
+    let mask = TONE_MASK.load(Ordering::Relaxed);
+    let spread = TONE_SPREAD.load(Ordering::Relaxed);
+    let channels = bytes_per_frame / 3;
+    let mut n = TONE_PHASE.load(Ordering::Relaxed);
+
+    let descs = std::slice::from_raw_parts(t.iso_packet_desc.as_ptr(), t.num_iso_packets as usize);
+    let mut off = 0usize;
+    for d in descs.iter() {
+        let frames = d.length as usize / bytes_per_frame;
+        for _ in 0..frames {
+            for c in 0..channels {
+                let on = (mask >> c) & 1 == 1;
+                // One frequency per channel makes the output mapping readable in
+                // a single capture, instead of one run per channel.
+                let f = if spread { hz * (c as f64 + 1.0) } else { hz };
+                let phase = 2.0 * std::f64::consts::PI * f * (n as f64) / rate;
+                let sample = (phase.sin() * amp * 8_388_607.0) as i32;
+                let le = sample.to_le_bytes();
+                let p = t.buffer.add(off + c * 3);
+                *p = if on { le[0] } else { 0 };
+                *p.add(1) = if on { le[1] } else { 0 };
+                *p.add(2) = if on { le[2] } else { 0 };
+            }
+            off += bytes_per_frame;
+            n += 1;
+        }
+    }
+    TONE_PHASE.store(n, Ordering::Relaxed);
+}
+
+/// Raw bulk IN 0x86 payloads, written straight to a file when capturing.
+pub static PCM_DUMP: Mutex<Option<std::fs::File>> = Mutex::new(None);
+/// Bytes written to that file.
+pub static PCM_DUMP_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Start writing every audio-in payload to `path`.
+pub fn capture_pcm_to(path: &str) -> std::io::Result<()> {
+    let f = std::fs::File::create(path)?;
+    *PCM_DUMP.lock().unwrap() = Some(f);
+    Ok(())
+}
+
+/// Stop capturing and flush.
+pub fn stop_pcm_capture() {
+    *PCM_DUMP.lock().unwrap() = None;
+}
+
+/// I2S bit phase on the audio-in pipe, found once and kept.
+static REC_ALIGN: Mutex<Option<usize>> = Mutex::new(None);
+
+/// Forget the capture alignment, so the next payload re-locks.
+pub fn reset_rec_align() {
+    if let Ok(mut a) = REC_ALIGN.lock() {
+        *a = None;
+    }
+}
+
+/// Fill a sized OUT transfer from the playback queue.
+unsafe fn fill_out_pcm(t: &mut ffi::libusb_transfer) {
+    let len = t.length as usize;
+    let dst = std::slice::from_raw_parts_mut(t.buffer, len);
+    crate::audio::take_play(dst);
 }

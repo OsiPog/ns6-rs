@@ -1,19 +1,18 @@
 # ns6
 
-Userspace MIDI driver for the **Numark NS6** DJ controller on Linux.
+Userspace driver for the **Numark NS6** DJ controller on Linux: MIDI and audio.
 
 The NS6 exposes only vendor-specific USB interfaces, so no kernel driver binds it and
-no ALSA MIDI port appears — the controller is invisible to Mixxx and everything else.
-`ns6` speaks the device's Ploytec protocol over libusb and publishes an ordinary ALSA
-sequencer MIDI port in its place.
+no ALSA device appears — the controller is invisible to Mixxx and everything else.
+`ns6` speaks the device's Ploytec protocol over libusb, publishes an ordinary ALSA
+sequencer MIDI port in its place, and streams audio in and out of the sound card.
 
 > This is for the **original NS6**, USB ID `15e4:0079`. The NS6II is a different,
 > genuinely class-compliant device that already works on Linux and has a Mixxx mapping.
 
 ## Status
 
-Working. The controller shows up as an ALSA sequencer port and reports its
-surface.
+Working, both the control surface and the audio.
 
 | Piece | State |
 |---|---|
@@ -21,6 +20,9 @@ surface.
 | Vendor handshake (`'V'`, `'I'`, sample rate, start) | done, verified on hardware |
 | Endpoint roles and packet framing | done, from driver decompilation |
 | Device streaming: audio in, feedback, MIDI | done, verified on hardware |
+| Audio out: a sine written to the iso pipe comes out of the device | done, measured |
+| Audio in: the input bitstream decoded to PCM | done, measured |
+| Usable as a PipeWire sink and source | done, plays and records |
 | ALSA MIDI port visible to Mixxx/PortMidi | done, verified with `aseqdump` |
 | Control surface enumerated (`ns6 learn`) | done |
 | Mixxx mapping | in progress |
@@ -50,6 +52,10 @@ ns6 map        # move a control, say what it was; writes ns6-surface.toml
 ns6 learn      # watch the control surface: move a control, see its MIDI
 ns6 probe      # report device state and sweep bulk OUT configurations
 ns6 test       # emit synthetic MIDI on the ALSA port, no hardware needed
+ns6 audio      # send a test tone out, prove the audio path on hardware
+ns6 play F     # play 44100 Hz s32le stereo from a file, a pipe, or -
+ns6 rec F      # capture 44100 Hz s32le stereo to a file, a pipe, or -
+ns6 duplex P C # both at once
 ```
 
 `ns6 test` is the quickest way to confirm the ALSA half works:
@@ -165,6 +171,72 @@ installed it:
 systemctl stop ns6 && ns6 map ; systemctl start ns6
 ```
 
+## Audio
+
+The NS6 is a sound card as well as a control surface: four line/phono inputs, RCA
+master, balanced XLR, and a headphone jack, mixed by the device itself. Over USB it
+carries four output channels and a stereo input, all 24-bit at 44.1 kHz, and both
+directions work.
+
+The quickest check that the hardware is doing anything at all needs no cables:
+
+```sh
+ns6 audio            # a 1 kHz tone on all four output channels for six seconds
+NS6_TONE_SPREAD=1 ns6 audio    # a different frequency per channel
+```
+
+The input listens to the device's own mixer, not to the input jacks directly, so a
+tone played out over USB comes back on the input pipe. That round trip - out of the
+host, through the mixer, back into the host - is the fastest way to prove both
+directions at once:
+
+```sh
+NS6_PCM_DUMP=/tmp/in.raw ns6 audio 6      # tone out, raw input stream in
+```
+
+### As a PipeWire sink and source
+
+PipeWire's pipe modules turn the two streams into an ordinary sink and source that
+any application can select. Load them once:
+
+```sh
+pactl load-module module-pipe-sink   file=/tmp/ns6.sink   sink_name=NS6 \
+      format=s32le rate=44100 channels=2
+pactl load-module module-pipe-source file=/tmp/ns6.source source_name=NS6cap \
+      format=s32le rate=44100 channels=2
+```
+
+Then run the bridge with audio, which publishes the MIDI port and streams at the
+same time:
+
+```sh
+NS6_PLAY=/tmp/ns6.sink NS6_REC=/tmp/ns6.source ns6
+```
+
+Anything playing to the **NS6** sink now comes out of the controller, and **NS6cap**
+records what the controller's mixer is putting out. Without the two environment
+variables the bridge is MIDI-only, as before.
+
+Tuning:
+
+| Variable | Default | What it does |
+|---|---|---|
+| `NS6_PLAY_MS` | `40` | Audio queued ahead of the device, in ms. Latency against safety. |
+| `NS6_GAIN` | `1.0` | Output gain applied before the 24-bit clamp. |
+| `NS6_OUT_PAIRS` | `both` | Which of the two output pairs a stereo signal is written to: `a`, `b`, or `both`. |
+
+Round trip through the hardware measures 10-30 ms. Nothing resamples: the device's
+clock and the host's are independent, so a long session will eventually drift. Over
+half a minute the measured rate holds at 44.09-44.13 kHz and underruns stay at a few
+milliseconds, all of them at start-up.
+
+### After a power cycle, wait
+
+The device will happily stream USB - control transfers accepted, isochronous OUT
+with zero errors, bulk IN at full rate - while its analogue side is still dead,
+delivering digital silence in and nothing out. Give it ~15 s after power-on. A short
+wait looks exactly like a routing bug.
+
 ## Device access
 
 `ns6` talks to the raw USB device, so its usbfs node must be writable by you.
@@ -194,15 +266,15 @@ On NixOS, import the flake's module:
 ## How it works
 
 ```
-NS6 --bulk OUT 0x04--> silence keeps the device streaming
+NS6 <--iso  OUT 0x02-- audio out: 4 x 24-bit, 12 bytes per frame
+NS6 --bulk IN  0x86--> audio in: a raw I2S bitstream, decoded to stereo
 NS6 --bulk IN  0x83--> raw MIDI bytes (0xFD filler) --> ALSA seq --> Mixxx
-NS6 --bulk IN  0x86--> PCM in (drained)
-NS6 <--MIDI byte at offset 480 of each out block <-- ALSA seq <-- Mixxx
+NS6 <--bulk OUT 0x04-- MIDI out, framed to 42 bytes <-- ALSA seq <-- Mixxx
 ```
 
-The control surface only reports while the host is actively streaming PCM, so the
-driver must keep pumping silence even if you only care about MIDI. Each 512-byte
-output block carries 480 bytes of audio, one MIDI byte, and one control byte.
+The control surface only reports while the host is actively streaming, so the driver
+keeps the isochronous pipe running even if you only care about MIDI - with silence
+in it when nothing is playing.
 
 Full derivation, including the endpoint predicates and the traps worth knowing about,
 is in [docs/PROTOCOL.md](docs/PROTOCOL.md).
@@ -212,9 +284,10 @@ is in [docs/PROTOCOL.md](docs/PROTOCOL.md).
 | Path | Purpose |
 |---|---|
 | `src/protocol.rs` | Constants, framing and the invariants, with unit tests |
+| `src/audio.rs` | Audio both ways: the I2S input decoder, the output frame, the queues |
 | `src/device.rs` | USB transport: handshake, arming, streaming threads |
 | `src/midi.rs` | ALSA sequencer port |
-| `src/main.rs` | CLI: `run`, `probe`, `test` |
+| `src/main.rs` | CLI: `run`, `probe`, `test`, `audio`, `play`, `rec`, `duplex` |
 | `docs/PROTOCOL.md` | How the protocol was reverse-engineered |
 | `udev/` | Device access rule |
 

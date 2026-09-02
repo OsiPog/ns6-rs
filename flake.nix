@@ -49,8 +49,10 @@
           ];
           buildInputs = with pkgs; [ libusb1 alsa-lib ];
 
-          # Handy while developing against real hardware.
-          packages = with pkgs; [ alsa-utils usbutils ];
+          # Handy while developing against real hardware. sox measures what came
+          # back out of it; pulseaudio is here for pactl, which is what loads the
+          # PipeWire pipe modules the audio side is driven through.
+          packages = with pkgs; [ alsa-utils usbutils sox pulseaudio ];
         };
       });
 

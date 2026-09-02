@@ -6,6 +6,7 @@
 //!
 //! See `docs/PROTOCOL.md` for how the protocol was derived.
 
+mod audio;
 mod device;
 mod iso;
 mod ledmap;
@@ -17,6 +18,7 @@ mod term;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -36,7 +38,11 @@ fn usage() -> ! {
              ns6 probe     report device state and sweep bulk OUT configurations\n    \
              ns6 learn     watch the control surface: move a control, see its MIDI\n    \
              ns6 map       move a control, say what it was; writes ns6-surface.toml\n    \
-             ns6 test      emit synthetic MIDI on the ALSA port, no hardware needed\n\
+             ns6 test      emit synthetic MIDI on the ALSA port, no hardware needed\n    \
+             ns6 audio     stream a test tone out and capture the audio input\n    \
+             ns6 play F    play 44100 Hz s32le stereo from a file, pipe or -\n    \
+             ns6 rec F     capture 44100 Hz s32le stereo to a file, pipe or -\n    \
+             ns6 duplex P C  do both at once, from P and to C\n\
          \n\
          The device's usbfs node must be writable; see udev/70-numark-ns6.rules."
     );
@@ -55,6 +61,10 @@ fn main() {
         "jog" => cmd_jog(),
         "probe" => cmd_probe(),
         "test" => cmd_test(),
+        "audio" => cmd_audio(),
+        "play" => cmd_stream(true, false),
+        "rec" => cmd_stream(false, true),
+        "duplex" => cmd_stream(true, true),
         "-h" | "--help" | "help" => usage(),
         _ => usage(),
     };
@@ -231,6 +241,18 @@ fn cmd_run(mode: Mode) -> Result<(), Box<dyn std::error::Error>> {
         let (dev, stats, running) = (dev.clone(), stats.clone(), alive.clone());
         move || device::run_midi_out(dev, stats, running, midi_rx)
     }));
+    // Audio is optional and off unless somewhere to put it was named, because
+    // the bridge is useful on its own and the input pipe is expensive to decode.
+    let audio_paths = AudioPaths::from_env();
+    let with_audio = audio_paths.any();
+    if let Some(p) = audio_paths.play {
+        println!("audio out: reading {p}");
+        threads.push(spawn_play(p));
+    }
+    if let Some(p) = audio_paths.rec {
+        println!("audio in : writing {p}");
+        threads.push(spawn_rec(p));
+    }
     println!(
         "\nbridge running - connect Mixxx to \"{}\". Ctrl-C to stop.\n",
         midi::CLIENT_NAME
@@ -392,6 +414,9 @@ fn cmd_run(mode: Mode) -> Result<(), Box<dyn std::error::Error>> {
                 iso::MIDI_IN_BYTES.load(Ordering::Relaxed),
                 stats.midi_out_bytes.load(Ordering::Relaxed),
             );
+            if with_audio {
+                println!("  {}", audio_status());
+            }
             if !warned && ok == 0 && err > 0 {
                 warned = true;
                 eprintln!(
@@ -1878,6 +1903,381 @@ fn cmd_jog() -> Result<(), Box<dyn std::error::Error>> {
     }
     alive.store(false, Ordering::Relaxed);
     let _ = pump.join();
+    Ok(())
+}
+
+/// Drive real audio in both directions, for hardware testing.
+///
+/// The bridge streams silence out and throws the input away, so neither
+/// direction had ever been proven. This writes a sine into the isochronous OUT
+/// pipe and dumps bulk IN 0x86 to a file, so both can be measured against a
+/// loopback rig.
+fn cmd_audio() -> Result<(), Box<dyn std::error::Error>> {
+    fn env_u64(key: &str, default: u64) -> u64 {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| {
+                if let Some(hex) = v.strip_prefix("0x") {
+                    u64::from_str_radix(hex, 16).ok()
+                } else {
+                    v.parse().ok()
+                }
+            })
+            .unwrap_or(default)
+    }
+
+    let secs = std::env::args()
+        .nth(2)
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(6);
+    let hz = env_u64("NS6_TONE_HZ", 1000);
+    let mask = env_u64("NS6_TONE_CH", 0xF);
+    let amp = env_u64("NS6_TONE_AMP", 50);
+    let dump = std::env::var("NS6_PCM_DUMP").ok();
+
+    iso::TONE_HZ.store(hz, Ordering::Relaxed);
+    iso::TONE_MASK.store(mask, Ordering::Relaxed);
+    iso::TONE_AMP.store(amp, Ordering::Relaxed);
+    iso::TONE_SPREAD.store(std::env::var("NS6_TONE_SPREAD").is_ok(), Ordering::Relaxed);
+    iso::TONE_ON.store(std::env::var("NS6_NO_TONE").is_err(), Ordering::Relaxed);
+
+    println!(
+        "tone: {hz} Hz, {amp}% FS, channel mask 0x{mask:X}, {} s",
+        secs
+    );
+
+    let (dev, _streams) = open_for_output()?;
+    install_signal_handler();
+
+    if let Some(path) = &dump {
+        iso::capture_pcm_to(path)?;
+        println!("capturing bulk IN 0x86 to {path}");
+    }
+
+    let start = Instant::now();
+    while running() && start.elapsed() < Duration::from_secs(secs) {
+        if iso::DEVICE_GONE.load(Ordering::Relaxed) {
+            eprintln!("device left the bus");
+            break;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    iso::stop_pcm_capture();
+    iso::TONE_ON.store(false, Ordering::Relaxed);
+
+    println!(
+        "iso out: {} ok / {} err   bulk in: {} xfers / {} B   captured: {} B",
+        iso::ISO_OUT_OK.load(Ordering::Relaxed),
+        iso::ISO_OUT_ERR.load(Ordering::Relaxed),
+        iso::BULK_IN_OK.load(Ordering::Relaxed),
+        iso::BULK_IN_BYTES.load(Ordering::Relaxed),
+        iso::PCM_DUMP_BYTES.load(Ordering::Relaxed),
+    );
+    drop(dev);
+    Ok(())
+}
+
+/// Set when the playback source hits end of file.
+static PLAY_EOF: AtomicBool = AtomicBool::new(false);
+
+/// Where audio is read from and written to, when audio is running.
+///
+/// Both ends speak plain 32-bit little-endian stereo at 44.1 kHz: the device's
+/// own formats - four 24-bit output channels grouped by side, and an input that
+/// is a raw I2S bitstream - are awkward to hand to anything else, while s32le
+/// stereo is what `pw-cat`, `sox` and PipeWire's pipe modules all take without
+/// argument.
+struct AudioPaths {
+    play: Option<String>,
+    rec: Option<String>,
+}
+
+impl AudioPaths {
+    /// Paths for the bridge, which takes them from the environment because its
+    /// positional arguments belong to the MIDI side.
+    fn from_env() -> Self {
+        Self {
+            play: std::env::var("NS6_PLAY").ok(),
+            rec: std::env::var("NS6_REC").ok(),
+        }
+    }
+
+    fn any(&self) -> bool {
+        self.play.is_some() || self.rec.is_some()
+    }
+}
+
+/// Read audio from `path` and queue it for the device.
+///
+/// A FIFO is a sink that comes and goes - PipeWire closes its end whenever the
+/// sink suspends - so end of file on one is a wait, not a stop.
+fn spawn_play(path: String) -> thread::JoinHandle<()> {
+    use std::io::Read;
+
+    let pairs = audio::Pairs::from_env(std::env::var("NS6_OUT_PAIRS").ok().as_deref());
+    // How much audio to keep queued ahead of the device: latency against
+    // robustness. 40 ms rides out a scheduling hiccup without being felt.
+    let target_ms = std::env::var("NS6_PLAY_MS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(40);
+    let gain = std::env::var("NS6_GAIN")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(1.0);
+    let queue_limit = 44100 / 1000 * target_ms * audio::OUT_FRAME;
+
+    thread::spawn(move || {
+        let fifo = is_fifo(&path);
+        // A FIFO has to be opened non-blocking: with no writer yet, a plain
+        // open blocks forever, which would also hang shutdown.
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        if fifo {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NONBLOCK);
+        }
+        let mut src: Box<dyn Read> = if path == "-" {
+            Box::new(std::io::stdin())
+        } else {
+            match opts.open(&path) {
+                Ok(f) => Box::new(f),
+                Err(e) => {
+                    eprintln!("cannot read {path}: {e}");
+                    return;
+                }
+            }
+        };
+        audio::PLAY_ON.store(true, Ordering::Relaxed);
+
+        let mut buf = vec![0u8; 8 * 1024];
+        let mut carry: Vec<u8> = Vec::new();
+        let mut wire = Vec::with_capacity(8 * 1024 * 3 / 2);
+        while running() {
+            // Reading faster than the device plays would swallow a file whole
+            // and drop most of it at the queue's own limit.
+            if audio::play_queued() > queue_limit {
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            let n = match src.read(&mut buf) {
+                // On a FIFO, end of file means the writer closed - PipeWire
+                // suspending the sink - and the next one may still turn up. The
+                // read end stays valid, so there is nothing to reopen.
+                Ok(0) if fifo => {
+                    thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            carry.extend_from_slice(&buf[..n]);
+            wire.clear();
+            let mut used = 0;
+            let mut frame = [0u8; audio::OUT_FRAME];
+            while carry.len() - used >= 8 {
+                let s = |o: usize| -> i32 {
+                    i32::from_le_bytes([
+                        carry[used + o],
+                        carry[used + o + 1],
+                        carry[used + o + 2],
+                        carry[used + o + 3],
+                    ])
+                };
+                // s32 -> the device's 24-bit slots.
+                let l = ((s(0) >> 8) as f32 * gain) as i32;
+                let r = ((s(4) >> 8) as f32 * gain) as i32;
+                audio::encode_frame(
+                    l.clamp(-8_388_608, 8_388_607),
+                    r.clamp(-8_388_608, 8_388_607),
+                    pairs,
+                    &mut frame,
+                );
+                wire.extend_from_slice(&frame);
+                used += 8;
+            }
+            carry.drain(..used);
+            audio::push_play(&wire);
+        }
+        PLAY_EOF.store(true, Ordering::Relaxed);
+    })
+}
+
+/// Decode the device's audio input and write it to `path`.
+///
+/// Opening a FIFO for writing fails with `ENXIO` until something is reading it,
+/// and PipeWire only reads while the source is in use. Decoding 5.6 MB/s of
+/// bitstream into a pipe nobody holds open is pure waste, so capture stays off
+/// until there is a reader.
+fn spawn_rec(path: String) -> thread::JoinHandle<()> {
+    use std::io::Write;
+
+    thread::spawn(move || {
+        let fifo = is_fifo(&path);
+        let open = || -> Option<Box<dyn Write>> {
+            if path == "-" {
+                return Some(Box::new(std::io::stdout()));
+            }
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true);
+            if fifo {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.custom_flags(libc::O_NONBLOCK);
+            } else {
+                opts.create(true).truncate(true);
+            }
+            match opts.open(&path) {
+                Ok(f) => Some(Box::new(f)),
+                // ENXIO is "no reader yet", which is not an error.
+                Err(e) if fifo && e.raw_os_error() == Some(libc::ENXIO) => None,
+                Err(e) => {
+                    eprintln!("cannot write {path}: {e}");
+                    None
+                }
+            }
+        };
+
+        let mut dst: Option<Box<dyn Write>> = None;
+        let mut out = Vec::new();
+        while running() {
+            if dst.is_none() {
+                audio::REC_ON.store(false, Ordering::Relaxed);
+                dst = open();
+                if dst.is_none() {
+                    thread::sleep(Duration::from_millis(250));
+                    continue;
+                }
+                // Start the new listener on a clean stream.
+                iso::reset_rec_align();
+                let _ = audio::drain_rec();
+                audio::REC_ON.store(true, Ordering::Relaxed);
+            }
+            let pcm = audio::drain_rec();
+            if pcm.is_empty() {
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            out.clear();
+            // 24-bit little-endian -> s32le, which is what everything else on
+            // this machine wants to be handed.
+            for s in pcm.chunks_exact(3) {
+                out.extend_from_slice(&[0, s[0], s[1], s[2]]);
+            }
+            match dst.as_mut().unwrap().write_all(&out) {
+                Ok(()) => {}
+                // The reader is not keeping up; newest audio wins.
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => dst = None,
+            }
+        }
+        if let Some(d) = dst.as_mut() {
+            let _ = d.flush();
+        }
+        audio::REC_ON.store(false, Ordering::Relaxed);
+    })
+}
+
+fn is_fifo(path: &str) -> bool {
+    std::fs::metadata(path)
+        .map(|m| std::os::unix::fs::FileTypeExt::is_fifo(&m.file_type()))
+        .unwrap_or(false)
+}
+
+/// Frame counters at the last status print, for the rate estimate.
+static LAST_STATUS: Mutex<Option<(Instant, u64, u64)>> = Mutex::new(None);
+
+/// One line of audio state, for the periodic status print.
+///
+/// The rates are the device's own clock, not ours: frames it took and frames it
+/// sent between two prints. They are worth watching, because nothing here
+/// resamples - if the device runs faster than whatever is feeding it, the
+/// difference comes out as underruns.
+fn audio_status() -> String {
+    let (out, inn) = (
+        audio::PLAY_FRAMES.load(Ordering::Relaxed),
+        audio::REC_FRAMES.load(Ordering::Relaxed),
+    );
+    let now = Instant::now();
+    let mut rates = String::new();
+    if let Ok(mut last) = LAST_STATUS.lock() {
+        if let Some((t, po, pi)) = *last {
+            let secs = now.duration_since(t).as_secs_f64();
+            if secs > 0.5 {
+                rates = format!(
+                    "  [{:.0} Hz out, {:.0} Hz in]",
+                    (out - po) as f64 / secs,
+                    (inn - pi) as f64 / secs
+                );
+            }
+        }
+        *last = Some((now, out, inn));
+    }
+    format!(
+        "audio: {out} frames out ({} underruns), {inn} frames in ({} dropped){rates}",
+        audio::PLAY_UNDERRUNS.load(Ordering::Relaxed),
+        audio::REC_OVERRUNS.load(Ordering::Relaxed),
+    )
+}
+
+/// Stream audio without the MIDI bridge: `ns6 play`, `ns6 rec`, `ns6 duplex`.
+fn cmd_stream(play: bool, rec: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // In duplex the two paths are separate: `ns6 duplex <play> <capture>`.
+    let first = std::env::args().nth(2).unwrap_or_else(|| "-".into());
+    let paths = AudioPaths {
+        play: play.then(|| first.clone()),
+        rec: rec.then(|| {
+            if play {
+                std::env::args().nth(3).unwrap_or_else(|| "-".into())
+            } else {
+                first.clone()
+            }
+        }),
+    };
+
+    audio::PLAY_ON.store(false, Ordering::Relaxed);
+    audio::REC_ON.store(false, Ordering::Relaxed);
+    iso::reset_rec_align();
+
+    let (dev, _streams) = open_for_output()?;
+    install_signal_handler();
+    eprintln!(
+        "streaming {} at 44100 Hz, s32le stereo",
+        match (play, rec) {
+            (true, true) => "both ways",
+            (true, false) => "to the device",
+            _ => "from the device",
+        }
+    );
+
+    let mut threads = Vec::new();
+    if let Some(p) = paths.play {
+        threads.push(spawn_play(p));
+    }
+    if let Some(p) = paths.rec {
+        threads.push(spawn_rec(p));
+    }
+
+    let mut last = Instant::now();
+    while running() && !iso::DEVICE_GONE.load(Ordering::Relaxed) {
+        // A file read to the end and played out is done; a live source - a pipe
+        // that is still open - is not.
+        if PLAY_EOF.load(Ordering::Relaxed) && audio::play_queued() == 0 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+        if last.elapsed() >= Duration::from_secs(5) {
+            last = Instant::now();
+            eprintln!("  {}", audio_status());
+        }
+    }
+    audio::PLAY_ON.store(false, Ordering::Relaxed);
+    audio::REC_ON.store(false, Ordering::Relaxed);
+    eprintln!("  {}", audio_status());
+    drop(dev);
     Ok(())
 }
 
