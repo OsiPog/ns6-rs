@@ -65,6 +65,26 @@ once as an output, and Mixxx pairs an input with an output by matching name.
 Two separately-named ports leave it opening only the input, so the surface works
 and the LEDs silently cannot.
 
+### Lighting specific LEDs
+
+`ns6 led` sends messages you name and holds them, which is how a question about
+one light gets answered without walking the whole space:
+
+```sh
+ns6 led cc 1:17=127            # MIDI channel 1, CC 17, value 127
+ns6 led cc 1:17 1:40           # both at once, value 127 each
+ns6 led cc 1:82=64             # some other value
+```
+
+Channels are MIDI channels, 1-5, as the recorded maps write them. Messages known
+to take the device off the bus are refused unless `NS6_LED_UNSAFE=1`, and
+`NS6_LED_HOLD` sets the seconds.
+
+Holding *several* is the part the walk below cannot do: it clears each candidate
+before sending the next, so it can show what one message lights but never what a
+combination does. That distinction is what says whether two lights are
+independent lamps or two faces of one state.
+
 ### Mapping the LEDs
 
 `ns6 leds` walks the output space so you can record what each message lights.
@@ -77,12 +97,25 @@ through the same pipe, using byte patterns `addr | 0x00/0x40/0x80/0xC0/0xE0` as
 clock and data. Sweeping arbitrary bytes therefore clocks arbitrary bits into
 that chip. A power cycle recovers it.
 
-One message is confirmed to do it: **CC 57 on channel 1**, the 58th candidate.
-Others almost certainly exist, and there is no way to predict them from the
+One message is confirmed to do it: **CC 57**, which kills the device on every
+channel tried. Others may well exist and there is no way to predict them from the
 protocol, so the walk collects them rather than being told about them: a message
 that drops the device is written into `ns6-leds.toml` as a `[[hazard]]` and
 stepped over from then on. `NS6_LED_SKIP=255,300` rules out positions by hand,
 and `NS6_LED_UNSAFE=1` sends everything regardless.
+
+**Treat a collected hazard as a suspect, not a verdict.** The walk blames whichever
+candidate was lit when the device vanished, and that is a guess: CC 59 was recorded
+this way and stepped over for a long time before being sent on its own, which it
+survives on channel 2 at value 5 and on channel 4 at both 5 and 127. The walk had
+blamed the wrong candidate. A wrong entry is not free either - it removes a number
+from every later walk, which is how a real display can stay hidden - so confirm a
+suspect by sending it alone with `ns6 led` before trusting it:
+
+```sh
+NS6_LED_UNSAFE=1 ns6 led cc 4:59=127     # survives; not a hazard
+NS6_LED_UNSAFE=1 ns6 led cc 1:57=127     # takes the device off the bus
+```
 
 Descriptions are saved as you give them, so a crash costs nothing already
 recorded, and the walk resumes:
@@ -110,6 +143,14 @@ something, and it tells you what arrived and asks what it was.
 It pairs up the MSB and LSB halves of a 14-bit control on its own, so a fader
 comes back as one entry with two messages. Enter alone throws a reading away if
 something else got caught in it, and `q` writes `ns6-surface.toml`.
+
+A run picks up where the last one left off. Anything already in
+`ns6-surface.toml` is carried over and its messages claimed, so moving a control
+that is already named does nothing and only what is still missing gets asked
+about. That is what the end of a recording session actually looks like: a
+handful of stragglers, usually the ones that needed a hardware switch set
+somewhere else first. Without it, collecting six more meant naming the other
+hundred again.
 
 Two things keep the readings clean. It spends a few seconds at startup watching
 an untouched panel, so anything that chatters on its own - the platter sensors

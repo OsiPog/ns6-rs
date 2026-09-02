@@ -385,6 +385,218 @@ impl Recorder {
     }
 }
 
-fn escape(s: &str) -> String {
+impl Recorder {
+    /// Re-read a surface written by an earlier run, so a second session adds to
+    /// it instead of starting over.
+    ///
+    /// This matters more than it looks. Recording the panel takes a while, and
+    /// what is left at the end is always a handful of stragglers - the controls
+    /// that were missed, or that turned out to need a hardware switch set
+    /// somewhere else first. Without this, collecting those six meant naming the
+    /// other seventy again.
+    ///
+    /// Every message of a carried-over control is claimed, so those controls are
+    /// not offered a second time: move one and nothing happens, which is the
+    /// point. Only what is not yet in the file gets asked about. Unparseable or
+    /// missing files are ignored, since the alternative is refusing to record
+    /// anything because of a typo in a comment.
+    pub fn load(&mut self, path: &std::path::Path) {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let entries = parse_surface(&text);
+        if entries.is_empty() {
+            return;
+        }
+        for (index, e) in entries.iter().enumerate() {
+            for key in &e.keys {
+                self.claimed.insert(*key, index);
+            }
+        }
+        let messages: usize = entries.iter().map(|e| e.keys.len()).sum();
+        println!(
+            "carried over {} already-named controls ({messages} messages); they \
+             will not be offered again",
+            entries.len()
+        );
+        self.entries = entries;
+    }
+}
+
+/// Parse a surface written by [`Recorder::to_toml`].
+///
+/// Lenient by design: anything it cannot make sense of is skipped rather than
+/// refused, because the alternative is declining to record a panel over a typo
+/// in a comment. The notes line is carried through verbatim rather than
+/// re-parsed - `to_toml` joins notes with ", " and the shapes inside contain
+/// commas of their own, so keeping it whole is what round-trips.
+fn parse_surface(text: &str) -> Vec<Entry> {
+    let mut description: Option<String> = None;
+    let mut notes: Option<String> = None;
+    let mut keys: Vec<Key> = Vec::new();
+    let mut entries = Vec::new();
+
+    fn flush(
+        description: &mut Option<String>,
+        notes: &mut Option<String>,
+        keys: &mut Vec<Key>,
+        entries: &mut Vec<Entry>,
+    ) {
+        match (description.take(), keys.is_empty()) {
+            (Some(d), false) => entries.push(Entry {
+                description: d,
+                keys: std::mem::take(keys),
+                notes: notes.take().into_iter().collect(),
+            }),
+            _ => {
+                keys.clear();
+                *notes = None;
+            }
+        }
+    }
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with("[[control]]") {
+            flush(&mut description, &mut notes, &mut keys, &mut entries);
+        } else if let Some(rest) = line.strip_prefix("description") {
+            description = rest.split_once('=').map(|(_, v)| unescape(v));
+        } else if line.starts_with('#') && description.is_some() && notes.is_none() {
+            notes = Some(line.trim_start_matches('#').trim().to_string());
+        } else if line.starts_with('{') {
+            if let Some(key) = parse_message(line) {
+                keys.push(key);
+            }
+        }
+    }
+    flush(&mut description, &mut notes, &mut keys, &mut entries);
+    entries
+}
+
+/// One `{ channel = 0, kind = "cc", number = 20 }` line.
+fn parse_message(line: &str) -> Option<Key> {
+    let body = line.trim_start_matches('{').trim_end_matches(&[',', '}'][..]);
+    let (mut channel, mut kind, mut number) = (None, None, None);
+    for field in body.trim_end_matches('}').split(',') {
+        let (name, value) = field.split_once('=')?;
+        match name.trim() {
+            "channel" => channel = value.trim().parse::<u8>().ok(),
+            "number" => number = value.trim().parse::<u8>().ok(),
+            "kind" => {
+                kind = Some(if value.contains("cc") {
+                    Kind::Cc
+                } else {
+                    Kind::Note
+                })
+            }
+            _ => {}
+        }
+    }
+    Some((channel?, kind?, number?))
+}
+
+pub fn escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Undo [`escape`], and strip the surrounding quotes.
+///
+/// Every one of these maps is written by the tool and read back by it, so a
+/// description that survives the trip only if it contains no quotation marks is
+/// a bug waiting for the first person to write `deck a "play"`. Trimming the
+/// quotes is not enough on its own.
+pub fn unescape(s: &str) -> String {
+    let s = s.trim();
+    let s = s.strip_prefix('"').unwrap_or(s);
+    let s = s.strip_suffix('"').unwrap_or(s);
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(next) => out.push(next),
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A button that has been pressed a few times.
+    fn pressed(channel: u8, number: u8) -> Control {
+        Control {
+            channel,
+            kind: Kind::Note,
+            number,
+            min: 0,
+            max: 127,
+            last: 127,
+            count: 8,
+            last_seen: Instant::now(),
+        }
+    }
+
+    /// A recording that has been written out and read back must be unchanged,
+    /// because that file is the only record of a session with the hardware.
+    #[test]
+    fn a_written_surface_reads_back_identically() {
+        let original = "\
+# Numark NS6 control surface, recorded with `ns6 map`.
+# Each entry is one physical control and the MIDI it emits.
+
+[[control]]
+description = \"crossfader\"
+# ch0 CC 7 (0..127, fader/knob (full travel)), ch0 CC 39 (0..127, fader/knob (full travel))
+messages = [
+  { channel = 0, kind = \"cc\", number = 7 },
+  { channel = 0, kind = \"cc\", number = 39 },
+]
+
+[[control]]
+description = \"deck a play\"
+# ch1 note 17 (0..127, button)
+messages = [
+  { channel = 1, kind = \"note\", number = 17 },
+]
+";
+        let entries = parse_surface(original);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].description, "crossfader");
+        assert_eq!(entries[0].keys.len(), 2);
+        assert_eq!(entries[1].keys, vec![(1, Kind::Note, 17)]);
+
+        let mut r = Recorder::new(&Surface::new());
+        r.entries = entries;
+        assert_eq!(r.to_toml(), original);
+    }
+
+    /// The point of loading: a control already in the file is not offered a
+    /// second time, however much it is moved.
+    #[test]
+    fn a_carried_over_control_is_not_offered_again() {
+        let mut r = Recorder::new(&Surface::new());
+        let entries = parse_surface(
+            "[[control]]\ndescription = \"deck a play\"\nmessages = [\n  \
+             { channel = 1, kind = \"note\", number = 17 },\n]\n",
+        );
+        for (index, e) in entries.iter().enumerate() {
+            for key in &e.keys {
+                r.claimed.insert(*key, index);
+            }
+        }
+
+        r.observe(&pressed(1, 17));
+        assert!(r.poll().is_none(), "a claimed control was offered for naming");
+
+        // ... while something not in the file still is.
+        r.observe(&pressed(0, 0x45));
+        r.settled = Some(Instant::now() - SETTLE - std::time::Duration::from_millis(1));
+        assert!(r.poll().is_some(), "an unrecorded control was not offered");
+    }
 }

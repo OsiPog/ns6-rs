@@ -29,8 +29,9 @@ fn usage() -> ! {
          \n\
          USAGE:\n    \
              ns6 [run]     bridge the controller to an ALSA MIDI port (default)\n    \
-             ns6 led       light the controller's buttons, to check LED output\n    \
+             ns6 led       light specific LEDs; `led cc 1:17=127 1:40` holds several\n    \
              ns6 leds      walk the LED space and record what each note lights\n    \
+             ns6 bars      hunt the level displays; `bars step 1` drives one by hand\n    \
              ns6 jog       measure how many ticks a platter reports per turn\n    \
              ns6 probe     report device state and sweep bulk OUT configurations\n    \
              ns6 learn     watch the control surface: move a control, see its MIDI\n    \
@@ -50,6 +51,7 @@ fn main() {
         "map" => cmd_run(Mode::Map),
         "led" => cmd_led(),
         "leds" => cmd_leds(),
+        "bars" => cmd_bars(),
         "jog" => cmd_jog(),
         "probe" => cmd_probe(),
         "test" => cmd_test(),
@@ -274,11 +276,15 @@ fn cmd_run(mode: Mode) -> Result<(), Box<dyn std::error::Error>> {
             "{}\n\n\
              Move a control, then tell me what it was. Repeat for as many as you\n\
              like; Enter alone throws a reading away so you can try again, and\n\
-             `q` finishes and writes ns6-surface.toml.\n\n\
+             `q` finishes and writes {SURFACE_MAP}. Anything already in that\n\
+             file is carried over and not asked about again, so a second run\n\
+             only picks up what is still missing.\n\n\
              Ready - move something.",
             seen.lines().next().unwrap_or("0 controls seen")
         );
-        recorder = Some(learn::Recorder::new(&surface));
+        let mut r = learn::Recorder::new(&surface);
+        r.load(std::path::Path::new(SURFACE_MAP));
+        recorder = Some(r);
         thread::spawn(move || {
             let mut line = String::new();
             while std::io::stdin().read_line(&mut line).unwrap_or(0) > 0 {
@@ -398,7 +404,7 @@ fn cmd_run(mode: Mode) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some(r) = recorder.as_ref() {
-        let path = std::path::Path::new("ns6-surface.toml");
+        let path = std::path::Path::new(SURFACE_MAP);
         match std::fs::write(path, r.to_toml()) {
             Ok(()) => println!("\nwrote {} controls to {}", r.entries.len(), path.display()),
             Err(e) => eprintln!("\ncould not write {}: {e}", path.display()),
@@ -612,10 +618,13 @@ fn cmd_test() -> Result<(), Box<dyn std::error::Error>> {
 ///     ns6 led cc 0                every control change on channel 1 at once
 ///     ns6 led cc                  every control change on every channel
 fn cmd_led() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    if args.first().map(String::as_str) == Some("seq") {
+        return cmd_seq(&args[1..]);
+    }
+
     let (dev, _streams) = open_for_output()?;
     install_signal_handler();
-
-    let args: Vec<String> = std::env::args().skip(2).collect();
     let parse = |s: &String| -> Option<u8> {
         let s = s.trim();
         if let Some(hex) = s.strip_prefix("0x") {
@@ -624,6 +633,13 @@ fn cmd_led() -> Result<(), Box<dyn std::error::Error>> {
             s.parse().ok()
         }
     };
+
+    // Everything sent, so the end of the command can clear exactly that. The
+    // old code cleared notes 0x00..0x60 on every channel regardless, which
+    // cleared nothing at all after a `cc` run - and LEDs on this device are
+    // control change, so that was every run that lit anything.
+    let mut lit: Vec<[u8; 3]> = Vec::new();
+    let unsafe_ok = std::env::var("NS6_LED_UNSAFE").is_ok();
 
     // An optional leading "cc" or "note" picks the message type; LEDs on this
     // device are control change, so being able to send either matters.
@@ -634,23 +650,84 @@ fn cmd_led() -> Result<(), Box<dyn std::error::Error>> {
             _ => (0x90, "note", &args[..]),
         };
 
-    if rest.len() == 3 {
+    let hold_secs = |default: u64| {
+        Duration::from_secs(
+            std::env::var("NS6_LED_HOLD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default),
+        )
+    };
+
+    if rest.iter().any(|a| a.contains(':')) {
+        // Several named messages, held together. This is the only way to ask
+        // whether two lights are independent lamps or two faces of one state:
+        // the walk in `ns6 leds` clears each candidate before sending the next,
+        // so it can never show what a combination does.
+        //
+        // Channels here are MIDI channels, 1-5, as the recorded maps write them.
+        let specs: Vec<(u8, u8, u8)> = rest
+            .iter()
+            .filter(|a| a.contains(':'))
+            .filter_map(|a| {
+                let (ch, rest) = a.split_once(':')?;
+                let (num, val) = match rest.split_once('=') {
+                    Some((n, v)) => (n, parse(&v.to_string())?),
+                    None => (rest, 0x7F),
+                };
+                let ch: u8 = parse(&ch.to_string())?;
+                Some((ch.saturating_sub(1) & 0x0F, parse(&num.to_string())?, val))
+            })
+            .collect();
+        if specs.len() != rest.iter().filter(|a| a.contains(':')).count() {
+            return Err("could not read a spec; each is channel:number[=value], \
+                        as in `ns6 led cc 1:17=127 1:40`"
+                .into());
+        }
+        let hold = hold_secs(20);
+        println!(
+            "sending {} message(s) together, holding {}s:",
+            specs.len(),
+            hold.as_secs()
+        );
+        for &(ch, num, val) in &specs {
+            if ledmap::is_hazard_number(kind, num) && !unsafe_ok {
+                println!(
+                    "  ch{} {kind_name} 0x{num:02X} ({num})  SKIPPED - takes the device \
+                     off the bus. NS6_LED_UNSAFE=1 sends it anyway.",
+                    ch + 1
+                );
+                continue;
+            }
+            println!("  ch{} {kind_name} 0x{num:02X} ({num}) = {val}", ch + 1);
+            let msg = [kind | ch, num, val];
+            dev.write_midi(&msg)?;
+            lit.push(msg);
+        }
+        println!("\nlook at the panel. Everything above is lit at once.");
+        thread::sleep(hold);
+    } else if rest.len() == 3 {
         let (ch, num, val) = (
             parse(&rest[0]).unwrap_or(0),
             parse(&rest[1]).unwrap_or(0),
             parse(&rest[2]).unwrap_or(0),
         );
-        let hold = Duration::from_secs(
-            std::env::var("NS6_LED_HOLD")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(5),
-        );
+        if ledmap::is_hazard_number(kind, num) && !unsafe_ok {
+            return Err(format!(
+                "channel {} {kind_name} 0x{num:02X} ({num}) takes the device off the \
+                 bus and needs a power cycle. NS6_LED_UNSAFE=1 sends it anyway.",
+                ch + 1
+            )
+            .into());
+        }
+        let hold = hold_secs(5);
         println!(
             "channel {ch} {kind_name} 0x{num:02X} ({num}) value {val} - holding {}s",
             hold.as_secs()
         );
-        dev.write_midi(&[kind | (ch & 0x0F), num, val])?;
+        let msg = [kind | (ch & 0x0F), num, val];
+        dev.write_midi(&msg)?;
+        lit.push(msg);
         thread::sleep(hold);
     } else if args.first().map(String::as_str) == Some("sweep") {
         println!(
@@ -664,6 +741,9 @@ fn cmd_led() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 print!("\r  channel {} note 0x{note:02X}   ", ch + 1);
                 let _ = std::io::Write::flush(&mut std::io::stdout());
+                if ledmap::is_hazard_number(0x90, note) && !unsafe_ok {
+                    continue;
+                }
                 dev.write_midi(&[0x90 | ch, note, 0x7F])?;
                 thread::sleep(Duration::from_millis(400));
                 dev.write_midi(&[0x90 | ch, note, 0x00])?;
@@ -674,12 +754,7 @@ fn cmd_led() -> Result<(), Box<dyn std::error::Error>> {
         // Everything of one kind at once. Blunt, but it answers "can this light
         // be driven at all" in a single look at the panel, which a walk of
         // several hundred candidates does not.
-        let hold = Duration::from_secs(
-            std::env::var("NS6_LED_HOLD")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(8),
-        );
+        let hold = hold_secs(8);
         let channels: Vec<u8> = match rest.first().and_then(parse) {
             Some(ch) => vec![ch],
             None => (0..5u8).collect(),
@@ -697,11 +772,13 @@ fn cmd_led() -> Result<(), Box<dyn std::error::Error>> {
         for &ch in &channels {
             for num in 0..0x80u8 {
                 // Never send a message known to drop the device off the bus.
-                if ledmap::HAZARDS.contains(&(kind, ch, num)) {
+                if ledmap::is_hazard_number(kind, num) && !unsafe_ok {
                     skipped += 1;
                     continue;
                 }
-                dev.write_midi(&[kind | ch, num, 0x7F])?;
+                let msg = [kind | ch, num, 0x7F];
+                dev.write_midi(&msg)?;
+                lit.push(msg);
             }
         }
         if skipped > 0 {
@@ -710,13 +787,81 @@ fn cmd_led() -> Result<(), Box<dyn std::error::Error>> {
         thread::sleep(hold);
     }
 
-    // Leave nothing lit.
-    for ch in 0..5u8 {
-        for note in 0..0x60u8 {
-            let _ = dev.write_midi(&[0x90 | ch, note, 0x00]);
-        }
+    // Leave nothing lit - and clear the same messages that were sent, rather
+    // than a fixed range of notes, which missed control change entirely.
+    for msg in &lit {
+        let _ = dev.write_midi(&[msg[0], msg[1], 0x00]);
     }
 
+    Ok(())
+}
+
+/// One number, several values in turn, holding each.
+///
+/// Comparing values on the same display is otherwise four separate runs with a
+/// device open and a clear between each, which puts the display dark for longer
+/// than it is lit and makes the order hard to follow. Here they follow each other
+/// directly, in one session.
+///
+///     ns6 led seq cc 2:58=21,53,85,117
+///
+/// `NS6_LED_STEP` sets the milliseconds per value, default 2000.
+fn cmd_seq(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (kind, kind_name, rest): (u8, &str, &[String]) = match args.first().map(String::as_str) {
+        Some("note") => (0x90, "note", &args[1..]),
+        Some("cc") => (0xB0, "CC", &args[1..]),
+        _ => (0xB0, "CC", args),
+    };
+    let spec = rest
+        .first()
+        .ok_or("usage: ns6 led seq cc <channel>:<number>=<v1,v2,...>")?;
+    let (target, values) = spec
+        .split_once('=')
+        .ok_or("no values: expected <channel>:<number>=<v1,v2,...>")?;
+    let (ch_s, num_s) = target
+        .split_once(':')
+        .ok_or("expected <channel>:<number>=<v1,v2,...>")?;
+    let midi_ch: u8 = ch_s.trim().parse().map_err(|_| "bad channel")?;
+    let ch = midi_ch.saturating_sub(1) & 0x0F;
+    let number: u8 = num_s.trim().parse().map_err(|_| "bad number")?;
+    let values: Vec<u8> = values
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .collect();
+    if values.is_empty() {
+        return Err("no values could be read".into());
+    }
+    if ledmap::is_hazard_number(kind, number) && std::env::var("NS6_LED_UNSAFE").is_err() {
+        return Err(format!(
+            "{kind_name} {number} takes the device off the bus. NS6_LED_UNSAFE=1 sends it anyway."
+        )
+        .into());
+    }
+
+    let step = Duration::from_millis(
+        std::env::var("NS6_LED_STEP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2000),
+    );
+
+    let (dev, _streams) = open_for_output()?;
+    install_signal_handler();
+
+    println!(
+        "channel {midi_ch} {kind_name} {number}, {} values, {} ms each:\n",
+        values.len(),
+        step.as_millis()
+    );
+    for (i, &v) in values.iter().enumerate() {
+        if !running() {
+            break;
+        }
+        println!("  [{}/{}] value {v}", i + 1, values.len());
+        dev.write_midi(&[kind | ch, number, v])?;
+        thread::sleep(step);
+    }
+    let _ = dev.write_midi(&[kind | ch, number, 0x00]);
     Ok(())
 }
 
@@ -792,6 +937,663 @@ impl Drop for Streams {
 /// Enter interrupts, which is when the typing starts.
 /// Where the LED map is read back from and written to.
 const LED_MAP: &str = "ns6-leds.toml";
+const SURFACE_MAP: &str = "ns6-surface.toml";
+/// Where the multi-segment displays are recorded. Separate from the LED map
+/// because the entries are a different shape: a *range* of numbers driven
+/// together at a *value*, rather than one message that turns one lamp on.
+const DISPLAY_MAP: &str = "ns6-displays.toml";
+
+/// One described display: the numbers that drive it, held at the value that
+/// showed it.
+///
+/// The numbers are stored out in full rather than as a first..last range. A
+/// block is eight *unaccounted* numbers, and the accounted-for ones are skipped
+/// in between, so the eight are sparse - the first block on channel 1 is
+/// 0, 1, 2, 6, 19, 20, 29, 30. Written as a range that reads as 0..30, which is
+/// thirty-one numbers, twenty-three of which were never sent. The file is the
+/// only record of a session at the panel, and it has to be replayable.
+struct Display {
+    channel: u8,
+    kind: u8,
+    numbers: Vec<u8>,
+    value: u8,
+    description: String,
+}
+
+fn displays_to_toml(found: &[Display]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::from(
+        "# Numark NS6 multi-segment displays, recorded with `ns6 bars blocks`.\n\
+         # Send every number in `numbers` at `value` to show what is described.\n\
+         #\n\
+         # These are not in ns6-leds.toml because the walk that produced that file\n\
+         # could not see them: it sends one message at a time, and one message to a\n\
+         # bar or a ring lights a single segment.\n\
+         #\n\
+         # `value` is not a brightness. What it means differs per display and has\n\
+         # to be recorded, not assumed: the FX rings and the Serato bar light the\n\
+         # single LED at position `value`, while the strip search fills `value` of\n\
+         # its fifteen. Either way 127 is out of range, which is why a sweep at 127\n\
+         # found none of them.\n",
+    );
+    for d in found {
+        let numbers = d
+            .numbers
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = write!(
+            s,
+            "\n[[display]]\ndescription = \"{}\"\nchannel = {}\nkind = \"{}\"\nnumbers = [{}]\nvalue = {}\n",
+            learn::escape(&d.description),
+            d.channel,
+            if d.kind == 0xB0 { "cc" } else { "note" },
+            numbers,
+            d.value
+        );
+    }
+    s
+}
+
+fn displays_load(path: &std::path::Path) -> Vec<Display> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let (mut desc, mut ch, mut kind, mut value) = (None, None, None, None);
+    let mut numbers: Option<Vec<u8>> = None;
+    let field = |l: &str| l.split('=').nth(1).map(|v| v.trim().to_string());
+    let numeric = |v: Option<String>| -> Option<u8> {
+        v.and_then(|v| v.split('#').next().map(str::trim).and_then(|n| n.parse().ok()))
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with("[[display]]") {
+            desc = None;
+            ch = None;
+            kind = None;
+            numbers = None;
+            value = None;
+        } else if line.starts_with("description") {
+            desc = field(line).map(|v| learn::unescape(&v));
+        } else if line.starts_with("channel") {
+            ch = numeric(field(line));
+        } else if line.starts_with("kind") {
+            kind = field(line).map(|v| if v.contains("cc") { 0xB0u8 } else { 0x90 });
+        } else if line.starts_with("numbers") {
+            numbers = field(line).map(|v| {
+                v.trim_matches(|c| c == '[' || c == ']')
+                    .split(',')
+                    .filter_map(|n| n.trim().parse::<u8>().ok())
+                    .collect()
+            });
+        } else if line.starts_with("value") {
+            value = numeric(field(line));
+        }
+        if let (Some(d), Some(c), Some(k), Some(n), Some(v)) = (&desc, ch, kind, &numbers, value) {
+            out.push(Display {
+                channel: c,
+                kind: k,
+                numbers: n.clone(),
+                value: v,
+                description: d.clone(),
+            });
+            desc = None;
+            value = None;
+        }
+    }
+    if !out.is_empty() {
+        println!("carried over {} already-described displays", out.len());
+    }
+    out
+}
+
+/// Hunt for the panel's *level* displays - the FX PARAM rings, the strip search
+/// bars, the Serato strip, the MASTER meter.
+///
+/// `ns6 leds` cannot find these, and it is worth being precise about why, because
+/// it is not simply that it missed them. It walks control change and note on over
+/// **five** channels and sends every one at value **127**. Three assumptions are
+/// baked into that, and a bar display breaks all of them:
+///
+///   - **Five channels.** MIDI has sixteen. Channels 6-16 have never been sent
+///     anything at all.
+///   - **Control change and note on only.** A 14-bit level has an obvious
+///     carrier in MIDI - pitch bend - and it was never tried. Nor was program
+///     change.
+///   - **Value 127.** The layer indicators already proved the value can carry
+///     meaning rather than just on-ness, and for a display that reads its value
+///     as a level, one fixed value is the worst possible probe: it cannot
+///     animate, so it looks like a lamp if it responds at all.
+///
+/// So this ramps instead of holding. A level display sweeps, which is unmistakable
+/// out of the corner of an eye; a plain lamp just blinks once at its threshold.
+/// That difference is the whole point.
+fn cmd_bars() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    if args.first().map(String::as_str) == Some("blocks") {
+        return cmd_blocks(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("step") {
+        return cmd_step(&args[1..]);
+    }
+
+    let (dev, _streams) = open_for_output()?;
+    install_signal_handler();
+
+    let kind = args.first().map(String::as_str).unwrap_or("pb");
+
+    // Channels to try, as MIDI channels 1-16. `6-16` covers exactly the space
+    // `ns6 leds` never reached.
+    let range = args.iter().find(|a| a.contains('-') || a.parse::<u8>().is_ok());
+    let (first, last) = match range.map(String::as_str) {
+        Some(spec) => match spec.split_once('-') {
+            Some((a, b)) => (
+                a.trim().parse::<u8>().unwrap_or(1).max(1),
+                b.trim().parse::<u8>().unwrap_or(16).min(16),
+            ),
+            None => {
+                let c = spec.trim().parse::<u8>().unwrap_or(1).clamp(1, 16);
+                (c, c)
+            }
+        },
+        None => (1, 16),
+    };
+
+    // Seconds each channel gets. One ramp up and back down inside it.
+    let dwell = Duration::from_millis(
+        std::env::var("NS6_BARS_DWELL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2500),
+    );
+    // Pin the value instead of ramping. This is what separates "many numbers at
+    // once" from "the animation itself": same messages, same simultaneity, no
+    // movement.
+    let fixed = std::env::var("NS6_BARS_VALUE")
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok());
+
+    let steps: u32 = std::env::var("NS6_BARS_STEPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(if kind == "pb" || kind == "pc" { 48 } else { 16 });
+    let unsafe_ok = std::env::var("NS6_LED_UNSAFE").is_ok();
+
+    println!(
+        "\nRamping {kind} over MIDI channels {first}-{last}, {} ms each.\n\n\
+         Watch for anything that *sweeps* rather than blinks: the FX PARAM rings,\n\
+         the strip search bars, the Serato strip, the MASTER meter. A lamp can only\n\
+         switch on; a level display follows the ramp, which is what gives it away.\n",
+        dwell.as_millis()
+    );
+    if kind == "cc" || kind == "note" || kind == "unknown" {
+        println!(
+            "  note: this drives every number on the channel at once, so the\n  \
+             ordinary button lights will flicker too. Ignore anything that is\n  \
+             merely on or off; only a sweep matters.\n"
+        );
+    }
+
+    // For the `unknown` mode: every message the recorded map says lights
+    // something, so those can be left alone. Driving them too would set a
+    // hundred button lights flickering and bury the one thing being hunted -
+    // which is the whole difficulty with sweeping this space at all.
+    //
+    // Channel is deliberately ignored here. The panel-wide lights answer on any
+    // channel, so a number excluded only on the channel it was recorded from
+    // would light up again the moment channels 6-16 are driven - which is most
+    // of what this is for.
+    let mut known: Vec<(u8, u8)> = Vec::new();
+    if kind == "unknown" {
+        let mut map = ledmap::LedWalk::new(16, &[0xB0, 0x90], 0x80);
+        map.load(std::path::Path::new(LED_MAP));
+        known = map.found.iter().map(|f| (f.kind, f.number)).collect();
+        known.sort_unstable();
+        known.dedup();
+        println!(
+            "  leaving {} already-described numbers alone, on every channel, so the\n  \
+             panel stays dark except for whatever answers. Any movement is a find.\n",
+            known.len()
+        );
+    }
+
+    // The pipe takes 39 bytes per write, which is thirteen three-byte messages.
+    // Driving a whole channel one transfer at a time is thirteen times the USB
+    // round trips for nothing, and slow enough to make a ramp visibly step.
+    let mut batch: Vec<u8> = Vec::new();
+
+    let mut lit: Vec<[u8; 3]> = Vec::new();
+    for midi_ch in first..=last {
+        let ch = midi_ch - 1;
+        for step in 0..=steps {
+            if !running() {
+                break;
+            }
+            // Up then back down, so a display that only moves one way still shows.
+            let phase = if step * 2 <= steps { step * 2 } else { 2 * steps - step * 2 };
+            let level7 = fixed.unwrap_or((phase * 127 / steps).min(127) as u8);
+            let level14 = match fixed {
+                Some(v) => v as u16 * 129,
+                None => (phase * 16383 / steps).min(16383) as u16,
+            };
+
+            // The value on screen, so the moment something lights can be read
+            // off rather than guessed at afterwards.
+            print!("\r\x1b[K  channel {midi_ch:>2}   value {level7:>3}");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+
+            match kind {
+                // Pitch bend carries 14 bits and has no number: one message per
+                // channel, so the whole space is 16 messages. The cheapest probe
+                // there is, and the likeliest shape for a level.
+                "pb" => {
+                    dev.write_midi(&[0xE0 | ch, (level14 & 0x7F) as u8, (level14 >> 7) as u8])?;
+                }
+                // Program change is two bytes, and a display could read the
+                // program number as a level.
+                "pc" => {
+                    dev.write_midi(&[0xC0 | ch, level7])?;
+                }
+                // Every number on the channel, ramping together.
+                _ => {
+                    let statuses: &[u8] = if kind == "note" {
+                        &[0x90]
+                    } else if kind == "unknown" {
+                        &[0xB0, 0x90]
+                    } else {
+                        &[0xB0]
+                    };
+                    for &status in statuses {
+                        for num in 0..0x80u8 {
+                            if ledmap::is_hazard_number(status, num) && !unsafe_ok {
+                                continue;
+                            }
+                            if kind == "unknown" && known.contains(&(status, num)) {
+                                continue;
+                            }
+                            let msg = [status | ch, num, level7];
+                            if batch.len() + 3 > p::MIDI_OUT_PAYLOAD {
+                                dev.write_midi(&batch)?;
+                                batch.clear();
+                            }
+                            batch.extend_from_slice(&msg);
+                            lit.push(msg);
+                        }
+                    }
+                    if !batch.is_empty() {
+                        dev.write_midi(&batch)?;
+                        batch.clear();
+                    }
+                }
+            }
+            thread::sleep(dwell / (steps + 1));
+        }
+        if !running() {
+            break;
+        }
+    }
+    println!("\r\x1b[K  done - channels {first}-{last} of {kind}.");
+
+    // Put back whatever was driven.
+    for midi_ch in first..=last {
+        let ch = midi_ch - 1;
+        match kind {
+            // Centre, not zero: zero is full deflection one way.
+            "pb" => {
+                let _ = dev.write_midi(&[0xE0 | ch, 0x00, 0x40]);
+            }
+            "pc" => {
+                let _ = dev.write_midi(&[0xC0 | ch, 0]);
+            }
+            _ => {}
+        }
+    }
+    lit.sort_unstable();
+    lit.dedup();
+    for msg in &lit {
+        if batch.len() + 3 > p::MIDI_OUT_PAYLOAD {
+            let _ = dev.write_midi(&batch);
+            batch.clear();
+        }
+        batch.extend_from_slice(&[msg[0], msg[1], 0x00]);
+    }
+    if !batch.is_empty() {
+        let _ = dev.write_midi(&batch);
+    }
+
+    Ok(())
+}
+
+/// Every message the recorded map does not account for.
+///
+/// Channel is not a parameter, because nothing here depends on it. Numbers known
+/// to light something are excluded on every channel, since the panel-wide lights
+/// answer anywhere and excluding them per channel would put a hundred lit lamps
+/// next to the one thing being looked for. Hazards are excluded on every channel
+/// for the harder-won reason in `ledmap::is_hazard_number`.
+fn unaccounted() -> Vec<(u8, u8)> {
+    let mut map = ledmap::LedWalk::new(16, &[0xB0, 0x90], 0x80);
+    map.load(std::path::Path::new(LED_MAP));
+    let mut known: Vec<(u8, u8)> = map.found.iter().map(|f| (f.kind, f.number)).collect();
+    known.sort_unstable();
+    known.dedup();
+
+    let unsafe_ok = std::env::var("NS6_LED_UNSAFE").is_ok();
+    let mut out = Vec::new();
+    for status in [0xB0u8, 0x90] {
+        for n in 0..0x80u8 {
+            if ledmap::is_hazard_number(status, n) && !unsafe_ok {
+                continue;
+            }
+            if known.contains(&(status, n)) {
+                continue;
+            }
+            out.push((status, n));
+        }
+    }
+    out
+}
+
+/// Drive the unaccounted numbers on one channel and move the *value* by hand.
+///
+/// A ramp proved these displays read their value as a level, and then proved
+/// itself useless for reading the mapping off: it went past too quickly to see
+/// which value did what, and value 127 - the one the original walk used - turns
+/// out to be the one value that does nothing at all.
+///
+/// So the value stops moving on its own. Sit on one, look at the panel, step to
+/// the next.
+fn cmd_step(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let midi_ch = args
+        .first()
+        .and_then(|v| v.parse::<u8>().ok())
+        .unwrap_or(1)
+        .clamp(1, 16);
+    let ch = midi_ch - 1;
+
+    let (dev, _streams) = open_for_output()?;
+    install_signal_handler();
+    let candidates = unaccounted();
+
+    println!(
+        "\nMIDI channel {midi_ch}, {} unaccounted numbers, all held at one value.\n\n    \
+         right / left   value + 1 / - 1\n    \
+         ] / [          value + 8 / - 8\n    \
+         q              stop\n\n\
+         Nothing moves unless you move it, so a level can be looked at for as long\n\
+         as it takes. Value 127 does nothing here; the interesting end is low.\n",
+        candidates.len()
+    );
+
+    let Some(_raw) = term::RawMode::enable() else {
+        return Err("ns6 bars step needs a terminal: it reads arrow keys".into());
+    };
+
+    let send = |value: u8| -> Result<(), device::Error> {
+        let mut buf: Vec<u8> = Vec::new();
+        for &(status, n) in &candidates {
+            if buf.len() + 3 > p::MIDI_OUT_PAYLOAD {
+                dev.write_midi(&buf)?;
+                buf.clear();
+            }
+            buf.extend_from_slice(&[status | ch, n, value]);
+        }
+        if !buf.is_empty() {
+            dev.write_midi(&buf)?;
+        }
+        Ok(())
+    };
+
+    let mut value: i32 = 0;
+    let mut shown: Option<u8> = None;
+    let dwell = Duration::from_millis(90);
+    let mut last = Instant::now() - dwell;
+
+    send(0)?;
+    print!("  value {value:>3}");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+
+    while running() {
+        let pending = term::drain();
+        if pending.chars.iter().any(|c| *c == 'q' || *c == 'Q') {
+            break;
+        }
+        let mut delta = 0i32;
+        for c in &pending.chars {
+            match c {
+                ']' => delta += 8,
+                '[' => delta -= 8,
+                _ => {}
+            }
+        }
+        if let Some(arrow) = pending.arrow {
+            delta += if arrow == term::Key::Right { 1 } else { -1 };
+        }
+        if delta != 0 && last.elapsed() >= dwell {
+            last = Instant::now();
+            value = (value + delta).clamp(0, 127);
+            send(value as u8)?;
+            shown = Some(value as u8);
+            print!("\r\x1b[K  value {value:>3}");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    if shown.is_some() {
+        let _ = send(0);
+    }
+    println!();
+    Ok(())
+}
+
+/// The unaccounted numbers, walked in *blocks* rather than one at a time.
+///
+/// This exists because of how the first LED map went wrong. `ns6 leds` sends one
+/// message and asks what lit, which is exactly right for a button and exactly
+/// wrong for everything else on this panel. A bar, a ring, a meter is many LEDs
+/// with a number each, so the honest answer to "what did CC 96 light?" is *one
+/// segment* - a single dim LED somewhere among a hundred candidates, easy to miss
+/// and easier to dismiss while you are busy naming buttons. Every multi-segment
+/// display on the NS6 was invisible to that method, and stayed unmapped for it.
+///
+/// Lighting a run of consecutive numbers together turns the same hardware into
+/// something nobody could miss: a filled arc, a lit bar. Then the range is
+/// narrowed by halving the block.
+fn cmd_blocks(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let num = |i: usize, default: usize| -> usize {
+        args.get(i).and_then(|v| v.parse().ok()).unwrap_or(default)
+    };
+    let midi_ch = num(0, 1).clamp(1, 16) as u8;
+    let size = num(1, 8).max(1);
+    // An optional `96-110`, to walk one region closely. Each of these displays
+    // looks like a single number whose value is a position, so the useful shape
+    // is a wide first pass to find the region and then size 1 across it.
+    let (lo, hi) = match args.get(2).and_then(|a| a.split_once('-')) {
+        Some((a, b)) => (
+            a.trim().parse::<u8>().unwrap_or(0),
+            b.trim().parse::<u8>().unwrap_or(127),
+        ),
+        None => (0, 127),
+    };
+    let mut value: i32 = std::env::var("NS6_BARS_VALUE")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(5);
+    let ch = midi_ch - 1;
+
+    let (dev, _streams) = open_for_output()?;
+    install_signal_handler();
+
+    // Blocked per status, not across both: a block that straddled the control
+    // change / note boundary would be labelled with only one of them, and the
+    // label is the entire output of this walk.
+    let candidates: Vec<(u8, u8)> = unaccounted()
+        .into_iter()
+        .filter(|&(_, n)| n >= lo && n <= hi)
+        .collect();
+    if candidates.is_empty() {
+        return Err(format!(
+            "nothing unaccounted for on channel {midi_ch} in {lo}..{hi}"
+        )
+        .into());
+    }
+    let mut blocks: Vec<Vec<(u8, u8)>> = Vec::new();
+    for status in [0xB0u8, 0x90] {
+        let of_kind: Vec<(u8, u8)> = candidates.iter().copied().filter(|c| c.0 == status).collect();
+        blocks.extend(of_kind.chunks(size).map(<[(u8, u8)]>::to_vec));
+    }
+
+    let mut found = displays_load(std::path::Path::new(DISPLAY_MAP));
+    println!(
+        "\nMIDI channel {midi_ch}, numbers {lo}..{hi}: {} unaccounted, in {} blocks of {size}.\n\n    \
+         right / left   next block / back\n    \
+         ] / [          value + 1 / - 1, to find a level that shows\n    \
+         Enter          describe what is lit; it is saved at once\n    \
+         q              stop\n\n\
+         A button gives one lamp. A bar, ring or meter gives a run of them - that\n\
+         is the thing to watch for, and what the one-at-a-time walk could not show.\n\
+         The value is a *position*, not a level: it picks which segment lights, so\n\
+         ] and [ walk the lit LED along the display. Value starts at {value};\n\
+         127 is out of range and shows nothing, which is why the original walk\n\
+         missed every one of these.\n",
+        candidates.len(),
+        blocks.len()
+    );
+
+    let Some(_raw) = term::RawMode::enable() else {
+        return Err("ns6 bars blocks needs a terminal: it reads arrow keys".into());
+    };
+
+    let send = |block: &[(u8, u8)], level: u8| -> Result<(), device::Error> {
+        let mut buf: Vec<u8> = Vec::new();
+        for &(status, n) in block {
+            if buf.len() + 3 > p::MIDI_OUT_PAYLOAD {
+                dev.write_midi(&buf)?;
+                buf.clear();
+            }
+            buf.extend_from_slice(&[status | ch, n, level]);
+        }
+        if !buf.is_empty() {
+            dev.write_midi(&buf)?;
+        }
+        Ok(())
+    };
+
+    let label = |i: usize, value: i32| {
+        let block: &Vec<(u8, u8)> = &blocks[i];
+        format!(
+            "[{}/{}] {} {}  value {}",
+            i + 1,
+            blocks.len(),
+            if block[0].0 == 0xB0 { "CC" } else { "note" },
+            block
+                .iter()
+                .map(|&(_, n)| n.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            value
+        )
+    };
+
+    let dwell = Duration::from_millis(150);
+    let mut last_step = Instant::now() - dwell;
+    let mut index: usize = 0;
+    let mut shown: Option<usize> = None;
+
+    while running() {
+        let pending = term::drain();
+        if pending.chars.iter().any(|c| *c == 'q' || *c == 'Q') {
+            break;
+        }
+        let mut level_delta = 0i32;
+        for c in &pending.chars {
+            match c {
+                ']' => level_delta += 1,
+                '[' => level_delta -= 1,
+                _ => {}
+            }
+        }
+
+        if (pending.arrow.is_some() || level_delta != 0) && last_step.elapsed() >= dwell {
+            last_step = Instant::now();
+            if let Some(i) = shown {
+                send(&blocks[i], 0)?;
+            }
+            if let Some(arrow) = pending.arrow {
+                match arrow {
+                    term::Key::Right if shown.is_some() => index = (index + 1).min(blocks.len() - 1),
+                    term::Key::Left => index = index.saturating_sub(1),
+                    _ => {}
+                }
+            }
+            value = (value + level_delta).clamp(0, 127);
+            send(&blocks[index], value as u8)?;
+            shown = Some(index);
+            print!("\r\x1b[K  {}", label(index, value));
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+
+        if pending.enter && shown.is_some() {
+            let cooked = _raw.cooked();
+            println!("\n  {}", label(index, value));
+            print!("  what is lit? ");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line).unwrap_or(0) > 0 {
+                let line = line.trim();
+                if line.is_empty() {
+                    println!("  (nothing recorded)");
+                } else {
+                    let block = &blocks[index];
+                    let numbers: Vec<u8> = block.iter().map(|&(_, n)| n).collect();
+                    // The value is part of the key. It was not, and that lost
+                    // work: the platter ring shows four colours on one number,
+                    // and describing the second overwrote the first because both
+                    // were "CC 58 on channel 2". A number whose value means
+                    // something needs a description per value, which is the
+                    // whole point of these entries.
+                    found.retain(|d| {
+                        !(d.channel == ch
+                            && d.kind == block[0].0
+                            && d.numbers == numbers
+                            && d.value == value as u8)
+                    });
+                    found.push(Display {
+                        channel: ch,
+                        kind: block[0].0,
+                        numbers,
+                        value: value as u8,
+                        description: line.to_string(),
+                    });
+                    // Saved now rather than at exit: this walk can take the
+                    // device down without warning, and a description is the
+                    // expensive half of it.
+                    if let Err(e) = std::fs::write(DISPLAY_MAP, displays_to_toml(&found)) {
+                        eprintln!("  could not save: {e}");
+                    }
+                    println!("  recorded: {line}");
+                }
+            }
+            drop(cooked);
+            print!("\r\x1b[K  {}", label(index, value));
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            last_step = Instant::now();
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    if let Some(i) = shown {
+        let _ = send(&blocks[i], 0);
+    }
+    println!();
+    if !found.is_empty() {
+        println!("{} display(s) in {DISPLAY_MAP}", found.len());
+    }
+    Ok(())
+}
 
 fn cmd_leds() -> Result<(), Box<dyn std::error::Error>> {
     let (dev, _streams) = open_for_output()?;
@@ -1077,4 +1879,51 @@ fn cmd_jog() -> Result<(), Box<dyn std::error::Error>> {
     alive.store(false, Ordering::Relaxed);
     let _ = pump.join();
     Ok(())
+}
+
+#[cfg(test)]
+mod display_map {
+    use super::*;
+
+    /// The display map is written after every description because the walk can
+    /// take the device down mid-way, so reading it back has to be exact - it is
+    /// the only record of a session at the panel.
+    #[test]
+    fn a_written_display_map_reads_back_identically() {
+        let original = vec![
+            Display {
+                channel: 0,
+                kind: 0xB0,
+                // Sparse on purpose: this is what a block actually is.
+                numbers: vec![0, 1, 2, 6, 19, 20, 29, 30],
+                value: 5,
+                description: "serato strip, left half".into(),
+            },
+            Display {
+                channel: 1,
+                kind: 0x90,
+                numbers: vec![8],
+                value: 3,
+                description: "fx a param ring, \"outer\" arc".into(),
+            },
+        ];
+        let text = displays_to_toml(&original);
+        let path = std::env::temp_dir().join("ns6-display-map-roundtrip.toml");
+        std::fs::write(&path, &text).unwrap();
+        let back = displays_load(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(back.len(), 2, "wrong number of displays read back");
+        for (a, b) in original.iter().zip(back.iter()) {
+            assert_eq!(a.channel, b.channel);
+            assert_eq!(a.kind, b.kind);
+            // The sparse set must survive exactly. A range would not have.
+            assert_eq!(a.numbers, b.numbers);
+            assert_eq!(a.value, b.value);
+        }
+        // Descriptions carry quotes, so the escaping has to survive a round trip
+        // even though the reader is deliberately lenient about everything else.
+        assert_eq!(back[0].description, "serato strip, left half");
+        assert_eq!(displays_to_toml(&back), text);
+    }
 }

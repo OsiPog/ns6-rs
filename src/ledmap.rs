@@ -56,12 +56,40 @@ pub struct Found {
 /// the byte patterns `addr | 0x00/0x40/0x80/0xC0/0xE0`. Some byte sequences
 /// therefore reach hardware that has nothing to do with lighting buttons.
 ///
-/// `(kind, channel, number)`. Found the hard way; the walk steps over them
-/// rather than sending them, unless `NS6_LED_UNSAFE` is set.
+/// `(kind, channel, number)` records where each was *found*, but the channel is
+/// not part of the test - see [`is_hazard_number`].
 pub const HAZARDS: &[(u8, u8, u8)] = &[
-    // Confirmed twice: this one drops the device and needs a power cycle.
+    // Confirmed three times, and on more than one channel. The recorded channel
+    // is provenance only; see is_hazard_number.
     (0xB0, 0, 57),
 ];
+
+/// Whether this message drops the device, **on any channel**.
+///
+/// The channel a hazard was found on is recorded for provenance and deliberately
+/// not compared. CC 57 was found on channel 1, killed the device again inside a
+/// channel 2 block, and is the best explanation for a channel 4 drop that
+/// happened while it was excluded on channel 1 only. One number, every channel.
+///
+/// The trade is one-sided anyway: over-excluding costs one number in a hundred
+/// and twenty-eight, and under-excluding costs a power cycle.
+///
+/// # Trusting this list
+///
+/// Only messages that have been sent *on their own* and killed the device belong
+/// here. That sounds obvious and was got wrong: `ns6 leds` blames whichever
+/// candidate was lit when the device vanished, and on that basis CC 59 was
+/// recorded as destructive and stepped over for a long time. Sent by itself it
+/// is harmless - channel 2 at value 5, channel 4 at 5 and at 127, all survived.
+/// The walk had simply blamed the wrong candidate.
+///
+/// A wrong entry here is not free. It removes a number from every future walk,
+/// which is how a real display could stay hidden indefinitely, so a candidate
+/// blamed by a walk is a suspect and not a hazard until it has killed the device
+/// on its own.
+pub fn is_hazard_number(kind: u8, number: u8) -> bool {
+    HAZARDS.iter().any(|&(k, _, n)| k == kind && n == number)
+}
 
 pub struct LedWalk {
     candidates: Vec<Candidate>,
@@ -110,8 +138,11 @@ impl LedWalk {
 
     /// Whether this candidate is known to be destructive.
     pub fn is_hazard(&self, c: Candidate) -> bool {
-        let key = (c.kind, c.channel, c.number);
-        HAZARDS.contains(&key) || self.learned.contains(&key)
+        is_hazard_number(c.kind, c.number)
+            || self
+                .learned
+                .iter()
+                .any(|&(k, _, n)| k == c.kind && n == c.number)
     }
 
     /// Remember that this one took the device down, so a resume steps over it.
@@ -234,7 +265,7 @@ impl LedWalk {
                 continue;
             }
             if line.starts_with("description") {
-                description = field(line).map(|v| v.trim_matches('"').to_string());
+                description = field(line).map(|v| crate::learn::unescape(&v));
             } else if line.starts_with("channel") {
                 channel = field(line).and_then(|v| v.parse::<u8>().ok());
             } else if line.starts_with("kind") {
