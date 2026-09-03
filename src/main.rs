@@ -13,6 +13,7 @@ mod ledmap;
 mod learn;
 mod midi;
 mod protocol;
+mod pw;
 mod term;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -99,6 +100,15 @@ fn install_signal_handler() {
 
 fn running() -> bool {
     RUNNING.load(Ordering::Relaxed)
+}
+
+/// Whether the audio side still has a device to talk to.
+///
+/// The PipeWire loop runs on its own thread and has to wind down with the rest
+/// of the driver - which includes the controller being switched off mid-run,
+/// not just a Ctrl-C.
+fn audio_alive() -> bool {
+    running() && !iso::DEVICE_GONE.load(Ordering::Relaxed)
 }
 
 /// How deep each pipe's queue is and how many packets each isochronous URB
@@ -241,17 +251,25 @@ fn cmd_run(mode: Mode) -> Result<(), Box<dyn std::error::Error>> {
         let (dev, stats, running) = (dev.clone(), stats.clone(), alive.clone());
         move || device::run_midi_out(dev, stats, running, midi_rx)
     }));
-    // Audio is optional and off unless somewhere to put it was named, because
-    // the bridge is useful on its own and the input pipe is expensive to decode.
+    // Audio is a pair of PipeWire nodes, published for as long as the bridge
+    // runs so the controller is a sound card whether or not anything is playing
+    // through it. Naming a path takes the audio side over instead: that is what
+    // `NS6_PLAY`/`NS6_REC` are for, and a pipe or a file is still how to get at
+    // the streams on a machine with no sound server at all.
     let audio_paths = AudioPaths::from_env();
-    let with_audio = audio_paths.any();
-    if let Some(p) = audio_paths.play {
-        println!("audio out: reading {p}");
-        threads.push(spawn_play(p));
-    }
-    if let Some(p) = audio_paths.rec {
-        println!("audio in : writing {p}");
-        threads.push(spawn_rec(p));
+    let no_pipewire = std::env::var("NS6_NO_PIPEWIRE").is_ok();
+    let with_audio = audio_paths.any() || !no_pipewire;
+    if audio_paths.any() {
+        if let Some(p) = audio_paths.play {
+            println!("audio out: reading {p}");
+            threads.push(spawn_play(p));
+        }
+        if let Some(p) = audio_paths.rec {
+            println!("audio in : writing {p}");
+            threads.push(spawn_rec(p));
+        }
+    } else if !no_pipewire {
+        threads.push(pw::spawn(audio_alive));
     }
     println!(
         "\nbridge running - connect Mixxx to \"{}\". Ctrl-C to stop.\n",
@@ -2014,7 +2032,7 @@ impl AudioPaths {
 fn spawn_play(path: String) -> thread::JoinHandle<()> {
     use std::io::Read;
 
-    let pairs = audio::Pairs::from_env(std::env::var("NS6_OUT_PAIRS").ok().as_deref());
+    let out_to = audio::Out::from_env(std::env::var("NS6_OUT_PAIRS").ok().as_deref());
     // How much audio to keep queued ahead of the device: latency against
     // robustness. 40 ms rides out a scheduling hiccup without being felt.
     let target_ms = std::env::var("NS6_PLAY_MS")
@@ -2077,29 +2095,7 @@ fn spawn_play(path: String) -> thread::JoinHandle<()> {
             };
             carry.extend_from_slice(&buf[..n]);
             wire.clear();
-            let mut used = 0;
-            let mut frame = [0u8; audio::OUT_FRAME];
-            while carry.len() - used >= 8 {
-                let s = |o: usize| -> i32 {
-                    i32::from_le_bytes([
-                        carry[used + o],
-                        carry[used + o + 1],
-                        carry[used + o + 2],
-                        carry[used + o + 3],
-                    ])
-                };
-                // s32 -> the device's 24-bit slots.
-                let l = ((s(0) >> 8) as f32 * gain) as i32;
-                let r = ((s(4) >> 8) as f32 * gain) as i32;
-                audio::encode_frame(
-                    l.clamp(-8_388_608, 8_388_607),
-                    r.clamp(-8_388_608, 8_388_607),
-                    pairs,
-                    &mut frame,
-                );
-                wire.extend_from_slice(&frame);
-                used += 8;
-            }
+            let used = audio::encode_host(&carry, gain, out_to, &mut wire);
             carry.drain(..used);
             audio::push_play(&wire);
         }
@@ -2162,11 +2158,7 @@ fn spawn_rec(path: String) -> thread::JoinHandle<()> {
                 continue;
             }
             out.clear();
-            // 24-bit little-endian -> s32le, which is what everything else on
-            // this machine wants to be handed.
-            for s in pcm.chunks_exact(3) {
-                out.extend_from_slice(&[0, s[0], s[1], s[2]]);
-            }
+            audio::to_host(&pcm, &mut out);
             match dst.as_mut().unwrap().write_all(&out) {
                 Ok(()) => {}
                 // The reader is not keeping up; newest audio wins.

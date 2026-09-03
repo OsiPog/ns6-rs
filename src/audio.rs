@@ -4,9 +4,10 @@
 //!
 //! **Out** (isochronous `0x02`) is ordinary interleaved PCM: 4 channels of
 //! 24-bit little-endian, 12 bytes per frame, exactly as `protocol.rs` derived
-//! it from the driver. Measured on hardware: slots 0 and 1 come out of one side
-//! of the phones jack, slots 2 and 3 out of the other, so the device takes two
-//! stereo pairs whose slots are grouped by side rather than by pair.
+//! it from the driver. Measured on hardware, one slot at a time: slots 0 and 1
+//! are the **master** output and slots 2 and 3 the **headphone** jack. Nothing
+//! about that is on the wire to be read off it, and two earlier readings of it
+//! were wrong - see [`encode_frame_out`].
 //!
 //! **In** (bulk `0x86`) is not PCM at all. The device sends its ADC's raw I2S
 //! line: one bit per two-byte unit (bit 0 of the even byte, the odd byte is
@@ -94,41 +95,58 @@ pub fn take_play(dst: &mut [u8]) {
     PLAY_FRAMES.fetch_add((filled / OUT_FRAME) as u64, Ordering::Relaxed);
 }
 
-/// Which of the two stereo pairs a stereo source is written to.
+/// Which of the device's two outputs a stereo source is written to.
 #[derive(Clone, Copy, PartialEq)]
-pub enum Pairs {
-    A,
-    B,
+pub enum Out {
+    Master,
+    Phones,
     Both,
 }
 
-impl Pairs {
+impl Out {
+    /// `a` and `b` are still taken, from when the two outputs were thought to
+    /// be a pair of anonymous stereo pairs rather than master and headphones.
     pub fn from_env(v: Option<&str>) -> Self {
         match v {
-            Some("a") => Pairs::A,
-            Some("b") => Pairs::B,
-            _ => Pairs::Both,
+            Some("a") | Some("master") => Out::Master,
+            Some("b") | Some("phones") => Out::Phones,
+            _ => Out::Both,
         }
     }
 }
 
-/// Write one stereo frame into the device's four output slots.
+/// Write one frame of master and headphones into the device's four slots.
 ///
-/// Slots 0/1 drive one side of the output and slots 2/3 the other, so a stereo
-/// pair is (slot 0, slot 2) or (slot 1, slot 3).
-pub fn encode_frame(left: i32, right: i32, pairs: Pairs, out: &mut [u8; OUT_FRAME]) {
+/// The four slots are two outputs, not two decks and not two sides of one
+/// jack: **slots 0 and 1 are the master output, slots 2 and 3 the headphone
+/// jack**, in plain interleaved order. Measured by putting a tone in one slot
+/// at a time - `NS6_TONE_CH=0x1` through `0x8` - and listening at both.
+///
+/// This is the layout of a controller doing its mixing in software, which is
+/// what the NS6 is once its panel is switched to PC: the faders and cue
+/// buttons then only send MIDI and the internal mixer is out of the path, so
+/// the host mixes and sends a master feed and a cue feed. The headphone
+/// blend knob still works, and picks between this master feed and the cue one.
+pub fn encode_frame_out(master: (i32, i32), phones: (i32, i32), out: &mut [u8; OUT_FRAME]) {
     let put = |out: &mut [u8; OUT_FRAME], slot: usize, v: i32| {
         let le = v.to_le_bytes();
         out[slot * 3..slot * 3 + 3].copy_from_slice(&le[..3]);
     };
     out.fill(0);
-    if pairs != Pairs::B {
-        put(out, 0, right);
-        put(out, 2, left);
-    }
-    if pairs != Pairs::A {
-        put(out, 1, right);
-        put(out, 3, left);
+    put(out, 0, master.0);
+    put(out, 1, master.1);
+    put(out, 2, phones.0);
+    put(out, 3, phones.1);
+}
+
+/// Write one stereo frame to the output or outputs named.
+pub fn encode_frame(left: i32, right: i32, to: Out, out: &mut [u8; OUT_FRAME]) {
+    let silence = (0, 0);
+    let stereo = (left, right);
+    match to {
+        Out::Master => encode_frame_out(stereo, silence, out),
+        Out::Phones => encode_frame_out(silence, stereo, out),
+        Out::Both => encode_frame_out(stereo, stereo, out),
     }
 }
 
@@ -204,14 +222,113 @@ pub fn push_rec(bytes: &[u8]) {
     }
 }
 
-/// Take everything currently captured.
-pub fn drain_rec() -> Vec<u8> {
+/// Take at most `max` bytes of captured audio, rounded down to whole frames.
+///
+/// A PipeWire buffer asks for a fixed number of frames and has nowhere to put
+/// the rest, so taking everything would mean throwing away the remainder.
+pub fn take_rec(max: usize) -> Vec<u8> {
     match REC.lock() {
-        Ok(mut q) => q.drain(..).collect(),
+        Ok(mut q) => {
+            let n = max.min(q.len());
+            q.drain(..n - n % IN_FRAME).collect()
+        }
         Err(_) => Vec::new(),
     }
 }
 
+/// Take everything currently captured.
+pub fn drain_rec() -> Vec<u8> {
+    take_rec(usize::MAX)
+}
+
+/// Drop whatever is queued for playback.
+///
+/// A stream that stopped and started again is a new stream; what was left over
+/// from the last one is stale audio nobody asked to hear.
+pub fn clear_play() {
+    if let Ok(mut q) = PLAY.lock() {
+        q.clear();
+    }
+}
+
+/// Bytes per host-side frame: 32-bit little-endian stereo.
+///
+/// The device's own formats are awkward to hand to anything else - four 24-bit
+/// output slots grouped by side, and an input that is a raw I2S bitstream - so
+/// everything on the host side of this module speaks s32le stereo, which is
+/// what the PipeWire nodes, `pw-cat` and `sox` all take without argument.
+pub const HOST_FRAME: usize = 8;
+
+/// The range a 24-bit slot can carry.
+const SLOT_MIN: i32 = -8_388_608;
+const SLOT_MAX: i32 = 8_388_607;
+
+/// Convert host frames to wire frames, appending them to `out`.
+///
+/// Returns how many bytes of `src` were used, which is a whole number of
+/// frames: a caller reading from a pipe gets handed arbitrary boundaries and
+/// has to carry the remainder into the next call.
+pub fn encode_host(src: &[u8], gain: f32, to: Out, out: &mut Vec<u8>) -> usize {
+    let mut used = 0;
+    let mut frame = [0u8; OUT_FRAME];
+    while src.len() - used >= HOST_FRAME {
+        let s = |o: usize| -> i32 {
+            i32::from_le_bytes([
+                src[used + o],
+                src[used + o + 1],
+                src[used + o + 2],
+                src[used + o + 3],
+            ])
+        };
+        // s32 -> the device's 24-bit slots.
+        let l = ((s(0) >> 8) as f32 * gain) as i32;
+        let r = ((s(4) >> 8) as f32 * gain) as i32;
+        encode_frame(
+            l.clamp(SLOT_MIN, SLOT_MAX),
+            r.clamp(SLOT_MIN, SLOT_MAX),
+            to,
+            &mut frame,
+        );
+        out.extend_from_slice(&frame);
+        used += HOST_FRAME;
+    }
+    used
+}
+
+/// Bytes per host-side frame carrying all four channels: master, then phones.
+pub const QUAD_FRAME: usize = 16;
+
+/// Convert four-channel host frames to wire frames, appending them to `out`.
+///
+/// Channels 1-2 are the master output and 3-4 the headphones, which is what
+/// the device's four slots are. Returns the bytes of `src` used, a whole
+/// number of frames, as [`encode_host`] does.
+pub fn encode_host_quad(src: &[u8], gain: f32, out: &mut Vec<u8>) -> usize {
+    let mut used = 0;
+    let mut frame = [0u8; OUT_FRAME];
+    while src.len() - used >= QUAD_FRAME {
+        let s = |o: usize| -> i32 {
+            let v = i32::from_le_bytes([
+                src[used + o],
+                src[used + o + 1],
+                src[used + o + 2],
+                src[used + o + 3],
+            ]);
+            (((v >> 8) as f32 * gain) as i32).clamp(SLOT_MIN, SLOT_MAX)
+        };
+        encode_frame_out((s(0), s(4)), (s(8), s(12)), &mut frame);
+        out.extend_from_slice(&frame);
+        used += QUAD_FRAME;
+    }
+    used
+}
+
+/// Widen decoded 24-bit frames to s32le, appending them to `out`.
+pub fn to_host(pcm: &[u8], out: &mut Vec<u8>) {
+    for s in pcm.chunks_exact(3) {
+        out.extend_from_slice(&[0, s[0], s[1], s[2]]);
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,12 +378,62 @@ mod tests {
         assert_eq!(&buf[OUT_FRAME..], &[0u8; OUT_FRAME]);
     }
 
+    /// A PipeWire buffer and a pipe read both hand over whatever length they
+    /// happen to have, so a partial frame has to survive to the next call
+    /// rather than being played as half a sample.
     #[test]
-    fn stereo_lands_in_the_slots_the_hardware_uses() {
+    fn a_partial_host_frame_is_carried_not_consumed() {
+        let mut host = Vec::new();
+        for v in [0x0102_0300i32, 0x0405_0600] {
+            host.extend_from_slice(&v.to_le_bytes());
+        }
+        host.extend_from_slice(&[0xFF, 0xFF, 0xFF]); // a frame and a bit
+
+        let mut wire = Vec::new();
+        let used = encode_host(&host, 1.0, Out::Master, &mut wire);
+        assert_eq!(used, HOST_FRAME, "only whole frames may be consumed");
+        assert_eq!(wire.len(), OUT_FRAME);
+        // s32 -> 24-bit slots: the low byte is dropped, not rounded.
+        assert_eq!(&wire[0..3], &[0x03, 0x02, 0x01]); // slot 0: master left
+        assert_eq!(&wire[3..6], &[0x06, 0x05, 0x04]); // slot 1: master right
+        assert_eq!(&wire[6..12], &[0; 6]); // phones: not asked for
+    }
+
+    /// Four channels are two outputs, and getting them the wrong way round puts
+    /// the master mix in the headphones and the cue feed in the room.
+    #[test]
+    fn four_host_channels_split_master_from_phones() {
+        let mut host = Vec::new();
+        for v in [0x0100_0000i32, 0x0200_0000, 0x0300_0000, 0x0400_0000] {
+            host.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut wire = Vec::new();
+        let used = encode_host_quad(&host, 1.0, &mut wire);
+        assert_eq!(used, QUAD_FRAME);
+        assert_eq!(wire.len(), OUT_FRAME);
+        assert_eq!(&wire[0..3], &[0, 0, 0x01]); // slot 0: master left
+        assert_eq!(&wire[3..6], &[0, 0, 0x02]); // slot 1: master right
+        assert_eq!(&wire[6..9], &[0, 0, 0x03]); // slot 2: phones left
+        assert_eq!(&wire[9..12], &[0, 0, 0x04]); // slot 3: phones right
+    }
+
+    #[test]
+    fn capture_widens_into_the_high_bytes() {
+        let mut out = Vec::new();
+        to_host(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66], &mut out);
+        // 24-bit little-endian, so the sample's own bytes keep their order and
+        // the padding goes where the bits that were never sent would be.
+        assert_eq!(out, vec![0, 0x11, 0x22, 0x33, 0, 0x44, 0x55, 0x66]);
+    }
+
+    /// Asking for the headphones alone has to leave the master silent, which is
+    /// the whole point of there being two outputs.
+    #[test]
+    fn a_stereo_source_goes_only_where_it_was_sent() {
         let mut f = [0u8; OUT_FRAME];
-        encode_frame(0x010203, 0x040506, Pairs::A, &mut f);
-        assert_eq!(&f[0..3], &[0x06, 0x05, 0x04]); // slot 0: right
-        assert_eq!(&f[3..6], &[0, 0, 0]); // slot 1: pair B, unused
-        assert_eq!(&f[6..9], &[0x03, 0x02, 0x01]); // slot 2: left
+        encode_frame(0x010203, 0x040506, Out::Phones, &mut f);
+        assert_eq!(&f[0..6], &[0; 6]); // master: silent
+        assert_eq!(&f[6..9], &[0x03, 0x02, 0x01]); // slot 2: phones left
+        assert_eq!(&f[9..12], &[0x06, 0x05, 0x04]); // slot 3: phones right
     }
 }

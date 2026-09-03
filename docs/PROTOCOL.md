@@ -309,19 +309,40 @@ channels, 12 bytes per frame, written into the isochronous OUT packets at the fr
 counts the Bresenham pattern produces. Writing a sine into it comes out of the
 device, at the frequency asked for.
 
-The channel mapping was measured by giving each slot its own frequency
-(`NS6_TONE_SPREAD=1`) and looking at where each one landed:
+The channel mapping was measured by putting a tone in **one slot at a time** and
+listening at each output in turn:
+
+```sh
+for m in 0x1 0x2 0x4 0x8; do NS6_TONE_CH=$m NS6_TONE_AMP=20 ns6 audio 8; sleep 4; done
+```
 
 | Slot | Bytes | Where it comes out |
 |---|---|---|
-| 0 | 0..3 | one side of the output |
-| 1 | 3..6 | the same side as slot 0 |
-| 2 | 6..9 | the other side |
-| 3 | 9..12 | the same side as slot 2 |
+| 0 | 0..3 | master, left |
+| 1 | 3..6 | master, right |
+| 2 | 6..9 | headphones, left |
+| 3 | 9..12 | headphones, right |
 
-So the slots are grouped by **side**, not by pair: a stereo signal is (slot 0,
-slot 2) or (slot 1, slot 3), and the two pairs sum. Which analogue jack each pair
-reaches depends on the mixer's own routing, which is not on this wire.
+So the four slots are the device's **two outputs in plain interleaved order**: a
+master feed and a headphone feed, stereo each. Confirmed afterwards through the
+driver's own sink by giving each of its four channels a different pitch and hearing
+each land where the table says.
+
+This is what the device is in **PC mode**, which is how its panel has to be
+switched for any of this to be useful: the faders, EQ and cue buttons then only
+send MIDI and the internal mixer leaves the audio path, so the host mixes and sends
+these two feeds back. The controls that stay live are master level, phones level
+and the phones blend, which mixes the headphone feed (CUE) against the master feed
+(PGM).
+
+Two earlier readings of this were wrong, and both came from measuring with only one
+output in earshot. A per-slot sweep with `NS6_TONE_SPREAD=1` was read as "slots 0
+and 1 are one side of the phones jack, 2 and 3 the other", which made a stereo pair
+look like (slot 0, slot 2); playing those apparent pairs one at a time then made
+them look like the two decks of the internal mixer. Neither survives listening at
+the master **and** the phones with one slot driven at a time. The lesson is the
+same one the LED map keeps teaching: a reading taken where the effect cannot be
+seen in full is a guess wearing a measurement's clothes.
 
 ## What the input actually listens to
 

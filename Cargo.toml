@@ -11,6 +11,7 @@ readme = "README.md"
 libc = "0.2"
 rusb = "0.9"
 alsa = "0.9"
+pipewire = { version = "0.10.1", features = ["v0_3_49"] }
 
 [profile.release]
 opt-level = 2

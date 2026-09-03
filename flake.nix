@@ -19,8 +19,8 @@
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
 
-          nativeBuildInputs = [ pkgs.pkg-config ];
-          buildInputs = [ pkgs.libusb1 pkgs.alsa-lib ];
+          nativeBuildInputs = [ pkgs.pkg-config pkgs.rustPlatform.bindgenHook ];
+          buildInputs = [ pkgs.libusb1 pkgs.alsa-lib pkgs.pipewire ];
 
           meta = with pkgs.lib; {
             description = "Userspace MIDI driver for the Numark NS6 DJ controller";
@@ -46,13 +46,15 @@
             clippy
             rust-analyzer
             pkg-config
+            rustPlatform.bindgenHook
           ];
-          buildInputs = with pkgs; [ libusb1 alsa-lib ];
+          buildInputs = with pkgs; [ libusb1 alsa-lib pipewire ];
 
-          # Handy while developing against real hardware. sox measures what came
-          # back out of it; pulseaudio is here for pactl, which is what loads the
-          # PipeWire pipe modules the audio side is driven through.
-          packages = with pkgs; [ alsa-utils usbutils sox pulseaudio ];
+          # Handy while developing against real hardware: sox measures what came
+          # back out of it, and wireplumber's wpctl says whether the driver's
+          # nodes turned up in the graph. `pipewire` itself is a build input,
+          # which is also where pw-link and pw-play come from.
+          packages = with pkgs; [ alsa-utils usbutils sox wireplumber ];
         };
       });
 
@@ -82,7 +84,7 @@
               description = ''
                 Start the bridge automatically when the controller appears on the
                 USB bus. With this off the udev rule and the unit are still
-                installed, so `systemctl start ns6` works on demand.
+                installed, so `systemctl --user start ns6` works on demand.
               '';
             };
           };
@@ -96,12 +98,18 @@
             services.udev.extraRules = ''
               SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="15e4", ATTRS{idProduct}=="0079", TAG+="uaccess", GROUP="wheel", MODE="0660"${
                 lib.optionalString cfg.autoStart ''
-                  , TAG+="systemd", ENV{SYSTEMD_WANTS}+="ns6.service"''
+                  , TAG+="systemd", ENV{SYSTEMD_USER_WANTS}+="ns6.service"''
               }
             '';
 
-            systemd.services.ns6 = {
-              description = "Numark NS6 userspace MIDI driver";
+            # A user service, not a system one. The driver publishes its own
+            # PipeWire sink and source, and PipeWire is a session service: its
+            # socket lives in the user's runtime directory, which a root service
+            # has no business reaching into and no way to pick between if two
+            # people are logged in. The ALSA MIDI port belongs to the same
+            # session, so both halves land where the applications are.
+            systemd.user.services.ns6 = {
+              description = "Numark NS6 userspace driver";
               serviceConfig = {
                 ExecStart = lib.getExe cfg.package;
                 # open() waits a little for the device and then gives up, so a
@@ -109,10 +117,11 @@
                 # while the controller is switched off.
                 Restart = "on-failure";
                 RestartSec = 3;
-                # Needs raw usbfs and the ALSA sequencer, and nothing else.
-                ProtectSystem = "strict";
-                ProtectHome = true;
-                PrivateTmp = true;
+                # The sandboxing a system unit would carry - ProtectSystem,
+                # PrivateTmp - needs privileges a user manager does not reliably
+                # have, and buys little for a process that already has exactly
+                # its own user's reach. What it does need is raw usbfs, the ALSA
+                # sequencer and the session's PipeWire socket.
                 NoNewPrivileges = true;
                 RestrictAddressFamilies = [ "AF_UNIX" "AF_NETLINK" ];
               };

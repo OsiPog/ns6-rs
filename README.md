@@ -4,8 +4,9 @@ Userspace driver for the **Numark NS6** DJ controller on Linux: MIDI and audio.
 
 The NS6 exposes only vendor-specific USB interfaces, so no kernel driver binds it and
 no ALSA device appears — the controller is invisible to Mixxx and everything else.
-`ns6` speaks the device's Ploytec protocol over libusb, publishes an ordinary ALSA
-sequencer MIDI port in its place, and streams audio in and out of the sound card.
+`ns6` speaks the device's Ploytec protocol over libusb and puts it back where it
+belongs: an ordinary ALSA sequencer MIDI port for the control surface, and a PipeWire
+sink and source of its own for the audio, both there for as long as the driver runs.
 
 > This is for the **original NS6**, USB ID `15e4:0079`. The NS6II is a different,
 > genuinely class-compliant device that already works on Linux and has a Mixxx mapping.
@@ -22,7 +23,7 @@ Working, both the control surface and the audio.
 | Device streaming: audio in, feedback, MIDI | done, verified on hardware |
 | Audio out: a sine written to the iso pipe comes out of the device | done, measured |
 | Audio in: the input bitstream decoded to PCM | done, measured |
-| Usable as a PipeWire sink and source | done, plays and records |
+| Publishes its own PipeWire sink and source | done, plays and records |
 | ALSA MIDI port visible to Mixxx/PortMidi | done, verified with `aseqdump` |
 | Control surface enumerated (`ns6 learn`) | done |
 | Mixxx mapping | in progress |
@@ -41,13 +42,14 @@ nix run .              # or run directly
 nix develop            # dev shell with cargo, clippy, alsa-utils, usbutils
 ```
 
-Without Nix, you need `libusb-1.0` and `alsa-lib` development packages, then
+Without Nix, you need the `libusb-1.0`, `alsa-lib` and `pipewire` development
+packages, plus `libclang` (the PipeWire bindings are generated at build time), then
 `cargo build --release`.
 
 ## Usage
 
 ```sh
-ns6            # bridge the controller to an ALSA MIDI port (default)
+ns6            # bridge the controller: ALSA MIDI port + PipeWire sink and source
 ns6 map        # move a control, say what it was; writes ns6-surface.toml
 ns6 learn      # watch the control surface: move a control, see its MIDI
 ns6 probe      # report device state and sweep bulk OUT configurations
@@ -168,15 +170,15 @@ The driver claims the device exclusively, so stop the service first if you
 installed it:
 
 ```sh
-systemctl stop ns6 && ns6 map ; systemctl start ns6
+systemctl --user stop ns6 && ns6 map ; systemctl --user start ns6
 ```
 
 ## Audio
 
 The NS6 is a sound card as well as a control surface: four line/phono inputs, RCA
-master, balanced XLR, and a headphone jack, mixed by the device itself. Over USB it
-carries four output channels and a stereo input, all 24-bit at 44.1 kHz, and both
-directions work.
+master, balanced XLR, and a headphone jack. Over USB it carries four output channels
+— the master output and the headphone jack, a stereo feed each — and a stereo input,
+all 24-bit at 44.1 kHz. Both directions work.
 
 The quickest check that the hardware is doing anything at all needs no cables:
 
@@ -194,28 +196,69 @@ directions at once:
 NS6_PCM_DUMP=/tmp/in.raw ns6 audio 6      # tone out, raw input stream in
 ```
 
-### As a PipeWire sink and source
+### As a sound card
 
-PipeWire's pipe modules turn the two streams into an ordinary sink and source that
-any application can select. Load them once:
-
-```sh
-pactl load-module module-pipe-sink   file=/tmp/ns6.sink   sink_name=NS6 \
-      format=s32le rate=44100 channels=2
-pactl load-module module-pipe-source file=/tmp/ns6.source source_name=NS6cap \
-      format=s32le rate=44100 channels=2
-```
-
-Then run the bridge with audio, which publishes the MIDI port and streams at the
-same time:
+Running the bridge is all of it:
 
 ```sh
-NS6_PLAY=/tmp/ns6.sink NS6_REC=/tmp/ns6.source ns6
+ns6
 ```
 
-Anything playing to the **NS6** sink now comes out of the controller, and **NS6cap**
-records what the controller's mixer is putting out. Without the two environment
-variables the bridge is MIDI-only, as before.
+Two nodes appear in the graph and stay there until the driver stops:
+
+| Node | Shows up as | Carries |
+|---|---|---|
+| `ns6` | **Numark NS6 (master 1-2, phones 3-4)**, a sink | four channels: the master output and the headphone jack |
+| `ns6-mix` | **Numark NS6 (mixer output)**, a source | what the controller sends back |
+
+Both are s32le at 44.1 kHz, the device's own rate; PipeWire converts whatever an
+application speaks into that, so anything can select them — Mixxx, a browser, a
+recorder — with no modules to load and nothing to configure. `wpctl status` lists
+them; `pw-play --target ns6 something.wav` is the one-line check.
+
+### Master on 1-2, headphones on 3-4
+
+The four output channels are the device's two outputs, in plain interleaved order:
+
+| Channel | Slot | Comes out of |
+|---|---|---|
+| 1 | 0 | master, left |
+| 2 | 1 | master, right |
+| 3 | 2 | headphones, left |
+| 4 | 3 | headphones, right |
+
+Measured one slot at a time — `NS6_TONE_CH=0x1` through `0x8`, listening at both
+outputs — and then confirmed through the sink with a different pitch on each of the
+four channels.
+
+So **playing to channels 3-4 is heard in the headphones only**, which is the whole
+point of the split: cue a track without it going to the room. Turn the phones blend
+knob to CUE to hear that feed alone; it blends towards PGM, which is the master
+feed on 1-2.
+
+In Mixxx, pick this one device and assign **Master → channels 1-2** and
+**Headphones → channels 3-4**. A plain stereo application lands on 1-2, so a
+browser plays out of the master and not into somebody's ears.
+
+This is only true with the controller's panel switched to **PC**. In that mode its
+faders, EQ and cue buttons send MIDI and stop touching the audio path — the mixing
+is the host's job, and these two feeds are what the host sends back. The knobs that
+remain live are master level, phones level and the phones blend.
+
+Neither direction costs anything while nothing is linked to it. That matters more
+than it sounds: the input is 5.6 MB/s of bitstream to decode for 176 kB/s of audio,
+and it only runs while something is actually recording. Note that a level meter left
+open — pavucontrol's input tab, say — counts as something recording.
+
+The driver waits for PipeWire rather than requiring it. With no daemon to publish to
+it says so once, keeps the MIDI half running and retries, so a restarted PipeWire
+gets its nodes back and a driver started before the session's own services catches up
+on its own.
+
+The old path is still there for a machine with no sound server, or for getting at the
+raw streams: naming `NS6_PLAY` and/or `NS6_REC` takes the audio side over, reading
+and writing 44100 Hz s32le stereo through a file, a pipe or a FIFO, and publishes no
+nodes at all.
 
 Tuning:
 
@@ -223,7 +266,10 @@ Tuning:
 |---|---|---|
 | `NS6_PLAY_MS` | `40` | Audio queued ahead of the device, in ms. Latency against safety. |
 | `NS6_GAIN` | `1.0` | Output gain applied before the 24-bit clamp. |
-| `NS6_OUT_PAIRS` | `both` | Which of the two output pairs a stereo signal is written to: `a`, `b`, or `both`. |
+| `NS6_OUT_PAIRS` | `both` | Where a *stereo* source goes: `master`, `phones`, or `both` (`a` and `b` still work). The file and pipe path only — the sink addresses both outputs itself. |
+| `NS6_PLAY`, `NS6_REC` | unset | Stream through these paths instead of publishing nodes. |
+| `NS6_NO_PIPEWIRE` | unset | Publish nothing; MIDI only. |
+| `NS6_PW_DEBUG` | unset | Say when either node gains or loses its last link. |
 
 Round trip through the hardware measures 10-30 ms. Nothing resamples: the device's
 clock and the host's are independent, so a long session will eventually drift. Over
@@ -287,6 +333,7 @@ is in [docs/PROTOCOL.md](docs/PROTOCOL.md).
 | `src/audio.rs` | Audio both ways: the I2S input decoder, the output frame, the queues |
 | `src/device.rs` | USB transport: handshake, arming, streaming threads |
 | `src/midi.rs` | ALSA sequencer port |
+| `src/pw.rs` | The PipeWire sink and source, and what keeps them there |
 | `src/main.rs` | CLI: `run`, `probe`, `test`, `audio`, `play`, `rec`, `duplex` |
 | `docs/PROTOCOL.md` | How the protocol was reverse-engineered |
 | `udev/` | Device access rule |
