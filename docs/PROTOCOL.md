@@ -344,6 +344,33 @@ bytes is a wasteful way to carry it, which is presumably why the vendor driver
 posts such enormous transfers. Decoding is in `src/audio.rs`; the pad bits are also
 what the decoder locks its bit phase onto, since there is no word clock on the wire.
 
+### It is one stream, not a sequence of payloads
+
+Two properties of it belong to the **stream**, and holding them per-payload is
+wrong in a way that is silent:
+
+- **The bits are in the even bytes of the stream.** Which end of a byte pair a
+  payload begins on depends on the lengths of every payload before it. Take the
+  even bytes of each payload instead and one odd-length transfer puts every
+  payload after it on the odd bytes, which are always zero: the input goes silent
+  and never recovers.
+- **Frames straddle payload boundaries.** The leftover units at the end of one
+  payload and the first few of the next are one frame between them. Decoding each
+  payload from a remembered offset drops that frame - at 43 payloads a second,
+  43 frames a second - and a payload whose length is not a whole number of frames
+  moves the boundary for every payload after it, with nothing to notice it or
+  re-lock.
+
+Observed here every transfer is exactly `0x20000` bytes, which is 1024 frames, and
+the stream sits at bit phase 0 throughout - so neither fault fires, and both were
+found by reading rather than by hearing. The decoder now carries the parity and the
+leftover units across payloads, which makes payload length stop mattering.
+
+One more trap in locking on: **an all-zero window fits every phase.** It has to be
+refused rather than locked on to, because the way to be handed one is to be reading
+the odd bytes. Waiting for a bit to appear costs only the silence it would have
+decoded to; locking on nothing costs every sample after it.
+
 A 131072-byte transfer is 65536 units, which is exactly 1024 audio frames — the
 transfer size is frame-aligned, so the phase only has to be found once.
 

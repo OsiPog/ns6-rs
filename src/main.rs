@@ -262,6 +262,13 @@ fn cmd_run(mode: Mode) -> Result<(), Box<dyn std::error::Error>> {
         iso::dump_out_to(&path)?;
         println!("dumping wire frames to {path}");
     }
+    // The raw input bitstream, before this driver has had an opinion about it.
+    // The only way to tell what the device sent from what the decoder made of
+    // it, which is a question the decoded stream cannot answer about itself.
+    if let Ok(path) = std::env::var("NS6_PCM_DUMP") {
+        iso::capture_pcm_to(&path)?;
+        println!("dumping raw input bitstream to {path}");
+    }
     // The feedback endpoint's own bytes, for reading its format off the wire.
     if let Ok(n) = std::env::var("NS6_FB_DUMP") {
         iso::dump_feedback(n.parse().unwrap_or(32));
@@ -2220,9 +2227,24 @@ fn clock_status() -> String {
         0.0
     };
     format!(
-        "clock: device asks {rate:.2} Hz over {packets} ms, sending {:.2} Hz; sent - asked = {} frames",
+        "clock: device asks {rate:.2} Hz over {packets} ms, sending {:.2} Hz; sent - asked = {} frames\n  \
+         capture: rate-match {}, target {:.0} ms, asking {:+} ppm",
         iso::out_rate(p::SAMPLE_RATE as u64) as f64 / iso::RATE_FRAC as f64,
         sent as i64 - asked as i64,
+        // A client already speaking the device's rate may be given no
+        // resampler at all, and then there is nothing to ask for a correction
+        // from. Worth saying which case this is, because the capture queue
+        // drifts in the second one and there is nothing here that can stop it.
+        if pw::REC_MATCHING.load(Ordering::Relaxed) {
+            "offered"
+        } else {
+            "not offered"
+        },
+        // What the capture loop is actually asking for. A correction sitting on
+        // its clamp is a runaway rather than a drift, and the two look the same
+        // from the queue depth alone.
+        pw::REC_TARGET.load(Ordering::Relaxed) as f64 / audio::IN_FRAME as f64 / 44.1,
+        pw::REC_CORRECTION.load(Ordering::Relaxed),
     )
 }
 
@@ -2255,16 +2277,20 @@ fn audio_status() -> String {
         *last = Some((now, out, inn));
     }
     format!(
-        "audio: {out} frames out ({} underruns, {} dropped), {inn} frames in ({} dropped){rates}  queue {:.0} ms",
+        "audio: {out} frames out ({} underruns, {} dropped), {inn} frames in ({} dropped, {} short){rates}  queue {:.0} ms out / {:.0} ms in",
         audio::PLAY_UNDERRUNS.load(Ordering::Relaxed),
         // Drops mean the host is running ahead of the device's own clock, so
         // this counter is the drift made visible: nothing here resamples.
         audio::PLAY_DROPS.load(Ordering::Relaxed),
         audio::REC_OVERRUNS.load(Ordering::Relaxed),
+        audio::REC_UNDERRUNS.load(Ordering::Relaxed),
         // Where the rate matching has settled. It should sit near NS6_PLAY_MS
         // and stay there; a queue walking towards 250 ms or towards nothing is
         // the clock drift going uncorrected.
         audio::play_queued() as f64 / audio::OUT_FRAME as f64 / 44.1,
+        // The same question asked of the other direction, where the device is
+        // the producer and the graph the consumer.
+        audio::rec_queued() as f64 / audio::IN_FRAME as f64 / 44.1,
     )
 }
 

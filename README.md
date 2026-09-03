@@ -277,6 +277,25 @@ faders, EQ and cue buttons send MIDI and stop touching the audio path — the mi
 is the host's job, and these two feeds are what the host sends back. The knobs that
 remain live are master level, phones level and the phones blend.
 
+The input was measured the same way the output was, and it is exact: with the
+device's mixer fed a 60 Hz tone on the left and 150 Hz on the right, the captured
+stream came back on the right channels, at unity gain, with no clipping, and its
+residual against a perfect sine was **-138 dB across 28 unbroken seconds** - the
+median and the maximum both, which is to say every block of it.
+
+That measurement has to be taken through `ns6 duplex`, not through the graph. An
+effects host intercepts *sources* as well as sinks, and Easy Effects' input chain
+is the mirror of the output-side trap above: its echo canceller takes `ns6:monitor`
+as its reference and subtracts the playback back out of the capture, and its
+autogain then drives what is left into the limiter. Recorded through that, this same
+input arrives with the two channels identical, one of the two tones gone, and the
+result clipped flat - none of which the device or the driver did. Check what the
+source is actually linked to before believing a capture:
+
+```sh
+pw-link -l | grep -A2 ns6-mix        # what is reading it
+```
+
 Neither direction costs anything while nothing is linked to it. That matters more
 than it sounds: the input is 5.6 MB/s of bitstream to decode for 176 kB/s of audio,
 and it only runs while something is actually recording. Note that a level meter left
@@ -302,9 +321,12 @@ Tuning:
 | `NS6_PLAY`, `NS6_REC` | unset | Stream through these paths instead of publishing nodes. |
 | `NS6_NO_PIPEWIRE` | unset | Publish nothing; MIDI only. |
 | `NS6_PW_DEBUG` | unset | Say when either node gains or loses its last link. |
+| `NS6_REC_MS` | `20` | Captured audio held for the graph, in ms. The input's side of `NS6_PLAY_MS`. |
+| `NS6_NO_RATE_MATCH` | unset | Stop steering either resampler; the queues then drift. |
 | `NS6_NO_FEEDBACK` | unset | Send the nominal 44100 and ignore the rate the device asks for. |
 | `NS6_FB_DUMP` | unset | Hex-dump this many feedback packets, then stop. |
 | `NS6_OUT_DUMP` | unset | Write every wire frame handed to the device to this path. |
+| `NS6_PCM_DUMP` | unset | Write the raw input bitstream to this path, before it is decoded. |
 
 Round trip through the hardware measures 10-30 ms.
 
@@ -328,11 +350,24 @@ of a steady tone is a burst of gross distortion, once a minute or thereabouts.
 Answering the request settles the device's own correction and holds the
 difference to 53 frames - 1.2 ms - over three minutes.
 
-The driver reports it, because the only way to see any of this is from both sides
-at once:
+The capture direction has the same problem and gets the same treatment, one step
+milder. There the device is the producer and the graph the consumer, so the
+difference between the two clocks integrates in the queue the driver hands
+recorders from. Measured idle over twelve minutes that queue grew by **a
+millisecond a minute** - +16.7 ppm, nothing dropped, and on course to reach its
+250 ms cap in about four hours, which is an ordinary length of set. So the source
+asks its resampler for the same kind of correction the sink does, and the queue
+then sits at its target instead of climbing.
+
+A client already speaking the device's rate may be handed no resampler at all, and
+then there is nothing to ask; the driver says which case it is rather than assuming.
+
+The driver reports all of it, because the only way to see any of this is from both
+sides at once:
 
 ```
-clock: device asks 44101.10 Hz over 125018 ms, sending 44099.73 Hz; sent - asked = 641 frames
+clock: device asks 44101.10 Hz over 125018 ms, sending 44099.73 Hz; sent - asked = 641 frames; capture rate-match offered
+capture loop: target 20 ms, asking -16 ppm
 ```
 
 That last number staying put is the whole of it. `NS6_NO_FEEDBACK=1` sends the

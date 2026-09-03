@@ -47,6 +47,13 @@ pub static PLAY_UNDERRUNS: AtomicU64 = AtomicU64::new(0);
 pub static REC_FRAMES: AtomicU64 = AtomicU64::new(0);
 /// Frames dropped because nobody was draining the capture queue fast enough.
 pub static REC_OVERRUNS: AtomicU64 = AtomicU64::new(0);
+/// Frames a recorder asked for that the device had not sent - written out as
+/// silence, because there is nothing else honest to put there.
+///
+/// Counted for the same reason [`PLAY_UNDERRUNS`] is: a gap that nothing
+/// counts is a gap nothing can be shown, and the capture path's whole failure
+/// mode is quiet.
+pub static REC_UNDERRUNS: AtomicU64 = AtomicU64::new(0);
 
 /// About 250 ms of slack in each direction. Enough to ride out a scheduling
 /// hiccup, small enough that latency stays usable.
@@ -76,6 +83,11 @@ pub fn push_play(bytes: &[u8]) {
 /// How many bytes are queued for playback.
 pub fn play_queued() -> usize {
     PLAY.lock().map(|q| q.len()).unwrap_or(0)
+}
+
+/// How many bytes of captured audio are waiting to be collected.
+pub fn rec_queued() -> usize {
+    REC.lock().map(|q| q.len()).unwrap_or(0)
 }
 
 /// Fill `dst` with queued frames, zero-filling what is missing.
@@ -166,9 +178,18 @@ pub fn encode_frame(left: i32, right: i32, to: Out, out: &mut [u8; OUT_FRAME]) {
 ///
 /// Positions 24..32 and 56..64 of every 64-unit frame are always zero, which is
 /// enough to lock on to without a word clock. Returns the offset in units.
+///
+/// A window with no set bits in it at all is refused. Every phase fits it, so
+/// it would lock on the first one tried and be wrong as often as not - and the
+/// way to see an all-zero window is to be reading the odd bytes, which are
+/// always zero. Waiting for a bit to appear costs the silence it was going to
+/// decode to anyway; locking on nothing costs every sample after it.
 pub fn find_alignment(units: &[u8]) -> Option<usize> {
     let frames = (units.len() / IN_UNITS_PER_FRAME).min(64);
     if frames < 4 {
+        return None;
+    }
+    if !units[..frames * IN_UNITS_PER_FRAME].iter().any(|&b| b != 0) {
         return None;
     }
     'phase: for phase in 0..IN_UNITS_PER_FRAME {
@@ -185,40 +206,126 @@ pub fn find_alignment(units: &[u8]) -> Option<usize> {
     None
 }
 
+/// What the input decoder carries between payloads.
+///
+/// A bulk IN payload is not a whole number of audio frames unless it happens
+/// to be, and the bitstream does not restart at each one: it is one continuous
+/// I2S line cut into transfers wherever the transfers ended. So whatever is
+/// left of a frame at the end of a payload is the front of a frame, and it has
+/// to be kept.
+#[derive(Default)]
+pub struct Rec {
+    /// Whether the bit phase has been found. Once it has, [`Rec::units`] is
+    /// kept frame-aligned, so it never has to be found again.
+    locked: bool,
+    /// Units not yet decoded: what was left of the last payload, then the next.
+    units: Vec<u8>,
+    /// Index within the next payload of the first byte that carries a bit.
+    ///
+    /// The bits are in the even bytes *of the stream*, and which end of a byte
+    /// pair a payload begins on depends on the lengths of all the payloads
+    /// before it. Assuming every payload starts on an even one is right only
+    /// while they all have even lengths: one odd-length transfer and every
+    /// payload after it reads the odd bytes, which are always zero, so the
+    /// input goes silent and stays silent.
+    start: usize,
+}
+
+impl Rec {
+    /// A decoder that has seen nothing. `const`, so the one the bulk callback
+    /// uses can live in a `static` without a lazy initialiser.
+    pub const fn new() -> Self {
+        Self {
+            locked: false,
+            units: Vec::new(),
+            start: 0,
+        }
+    }
+
+    /// Forget everything, so the next payload re-locks.
+    pub fn reset(&mut self) {
+        self.locked = false;
+        self.units.clear();
+        self.start = 0;
+    }
+}
+
+/// Units to hold while still hunting for the phase.
+///
+/// [`find_alignment`] looks at up to 64 frames, so more than that is no help
+/// in locking on and an unbounded queue of it is a leak.
+const MAX_HUNT: usize = 64 * IN_UNITS_PER_FRAME;
+
+/// One 24-bit I2S slot, MSB first, sign-extended.
+fn word(bits: &[u8]) -> i32 {
+    let mut v: i32 = 0;
+    for &b in &bits[..SLOT_BITS] {
+        v = (v << 1) | b as i32;
+    }
+    (v << 8) >> 8 // sign-extend from 24 bits
+}
+
 /// Decode one bulk IN 0x86 payload into interleaved 24-bit little-endian stereo.
 ///
-/// `align` is remembered across payloads: the device keeps its framing, so the
-/// phase only has to be found once.
-pub fn decode_i2s(payload: &[u8], align: &mut Option<usize>, out: &mut Vec<u8>) {
-    // One bit per two-byte unit.
-    let units: Vec<u8> = payload.iter().step_by(2).map(|b| b & 1).collect();
-    let phase = match *align {
-        Some(p) => p,
-        None => match find_alignment(&units) {
+/// The phase is found once and then held by keeping `st` frame-aligned, rather
+/// than by remembering an offset into each payload. Remembering the offset
+/// works only for as long as every payload is a whole number of frames: the
+/// leftover units at the end of one and the phase-many at the start of the next
+/// are one frame between them, which was being dropped - and, worse, a payload
+/// whose length was *not* a multiple of a frame moved the boundary for every
+/// payload after it, with nothing to notice or re-lock.
+pub fn decode_i2s(payload: &[u8], st: &mut Rec, out: &mut Vec<u8>) {
+    // One bit per two-byte unit, in the even bytes of the *stream* - see
+    // [`Rec::start`] for why that is not the same as the even bytes of this
+    // payload.
+    let mut i = st.start;
+    while i < payload.len() {
+        st.units.push(payload[i] & 1);
+        i += 2;
+    }
+    // `i` is now the first index past the end, so it is one byte or two beyond
+    // it, and the difference is where the next payload starts.
+    st.start = i - payload.len();
+
+    if !st.locked {
+        match find_alignment(&st.units) {
             Some(p) => {
-                *align = Some(p);
-                p
+                st.units.drain(..p);
+                st.locked = true;
             }
-            None => return,
-        },
-    };
-
-    let word = |bits: &[u8]| -> i32 {
-        let mut v: i32 = 0;
-        for &b in &bits[..SLOT_BITS] {
-            v = (v << 1) | b as i32;
+            None => {
+                // Silence decodes to silence at every phase, so it can be
+                // handed on without committing to one - and it has to be,
+                // because an idle mixer sends bit-exact zeros for as long as
+                // it is idle. Refusing to lock *and* emitting nothing took the
+                // whole capture path dark until something was played: twelve
+                // minutes of it decoded not one frame.
+                let frames = st.units.len() / IN_UNITS_PER_FRAME;
+                if frames > 0 && !st.units.iter().any(|&b| b != 0) {
+                    out.resize(out.len() + frames * IN_FRAME, 0);
+                    st.units.drain(..frames * IN_UNITS_PER_FRAME);
+                    return;
+                }
+                // Not silence, and not yet enough to lock on to. Keep only as
+                // much as locking on can use.
+                if st.units.len() > MAX_HUNT {
+                    let drop = st.units.len() - MAX_HUNT;
+                    st.units.drain(..drop);
+                }
+                return;
+            }
         }
-        (v << 8) >> 8 // sign-extend from 24 bits
-    };
+    }
 
-    let mut i = phase;
-    while i + IN_UNITS_PER_FRAME <= units.len() {
+    let frames = st.units.len() / IN_UNITS_PER_FRAME;
+    for f in 0..frames {
+        let base = f * IN_UNITS_PER_FRAME;
         for slot in [0usize, 32] {
-            let v = word(&units[i + slot..i + slot + SLOT_BITS]);
+            let v = word(&st.units[base + slot..base + slot + SLOT_BITS]);
             out.extend_from_slice(&v.to_le_bytes()[..3]);
         }
-        i += IN_UNITS_PER_FRAME;
     }
+    st.units.drain(..frames * IN_UNITS_PER_FRAME);
 }
 
 /// Hand decoded frames to whoever is recording.
@@ -366,10 +473,10 @@ mod tests {
                 payload.push(0);
             }
         }
-        let mut align = None;
+        let mut st = Rec::default();
         let mut out = Vec::new();
-        decode_i2s(&payload, &mut align, &mut out);
-        assert_eq!(align, Some(0));
+        decode_i2s(&payload, &mut st, &mut out);
+        assert!(st.locked);
         assert_eq!(&out[..3], &[0x56, 0x34, 0x12]);
         let r = i32::from_le_bytes([
             out[3],
@@ -406,6 +513,115 @@ mod tests {
         take_play(&mut buf);
         assert_eq!(&buf[..OUT_FRAME], &[1u8; OUT_FRAME]);
         assert_eq!(&buf[OUT_FRAME..], &[0u8; OUT_FRAME]);
+    }
+
+    /// The bitstream is one continuous I2S line, and the transfers it arrives
+    /// in are cut wherever they were cut. So decoding it in pieces has to give
+    /// the same answer as decoding it whole, whatever the pieces are - and in
+    /// particular the frame straddling a boundary has to come out, once.
+    #[test]
+    fn a_payload_boundary_does_not_cost_a_frame() {
+        let mut payload = Vec::new();
+        for i in 0..40i32 {
+            for u in units_for(0x1000 + i, -i) {
+                payload.push(u);
+                payload.push(0);
+            }
+        }
+
+        let mut whole = Vec::new();
+        decode_i2s(&payload, &mut Rec::default(), &mut whole);
+        assert_eq!(whole.len(), 40 * IN_FRAME, "40 frames in, 40 frames out");
+
+        // Lengths deliberately not multiples of a frame, and one of them odd,
+        // which is what a short transfer would look like.
+        let mut st = Rec::default();
+        let mut pieces = Vec::new();
+        let mut at = 0;
+        for len in [300usize, 1024, 71, 4096, 2] {
+            let end = (at + len).min(payload.len());
+            decode_i2s(&payload[at..end], &mut st, &mut pieces);
+            at = end;
+        }
+        decode_i2s(&payload[at..], &mut st, &mut pieces);
+        assert_eq!(pieces, whole, "a boundary changed the audio");
+    }
+
+    /// The bits live in the even bytes of the stream. One odd-length payload
+    /// moves every payload after it onto the odd bytes, which are always zero,
+    /// so the input would go silent and never recover.
+    #[test]
+    fn an_odd_length_payload_does_not_silence_the_input() {
+        let mut payload = Vec::new();
+        for i in 0..40i32 {
+            for u in units_for(0x4000 + i, i) {
+                payload.push(u);
+                payload.push(0);
+            }
+        }
+        let mut whole = Vec::new();
+        decode_i2s(&payload, &mut Rec::default(), &mut whole);
+
+        // Split so that the first piece has an odd length.
+        let mut st = Rec::default();
+        let mut pieces = Vec::new();
+        decode_i2s(&payload[..1025], &mut st, &mut pieces);
+        decode_i2s(&payload[1025..], &mut st, &mut pieces);
+        assert_eq!(pieces, whole, "an odd-length payload changed the audio");
+        assert!(
+            pieces.iter().any(|&b| b != 0),
+            "the input went silent, which is the failure this guards"
+        );
+    }
+
+    /// An all-zero window fits every phase, so locking on one would be a coin
+    /// toss - and a phase locked wrongly during silence decodes the audio that
+    /// follows it bit-rotated.
+    #[test]
+    fn silence_is_not_something_to_lock_on_to() {
+        assert_eq!(find_alignment(&[0u8; 64 * 8]), None);
+    }
+
+    /// But it still has to come out. An idle mixer sends bit-exact zeros for
+    /// as long as it is idle, and silence is silence at every phase, so it can
+    /// be passed on without committing to one. Not doing that took the capture
+    /// path dark until something was played - measured, twelve minutes of it
+    /// decoded not one frame.
+    #[test]
+    fn silence_is_still_passed_on() {
+        let mut st = Rec::default();
+        let mut out = Vec::new();
+        // Ten frames of digital silence, as the device actually sends them.
+        decode_i2s(&[0u8; 10 * IN_UNITS_PER_FRAME * 2], &mut st, &mut out);
+        assert_eq!(out.len(), 10 * IN_FRAME, "silence has to arrive as frames");
+        assert!(out.iter().all(|&b| b == 0));
+        assert!(!st.locked, "and still without committing to a phase");
+
+        // And audio arriving after it locks and decodes properly.
+        let mut payload = Vec::new();
+        for _ in 0..8 {
+            for u in units_for(0x123456, -0x2000) {
+                payload.push(u);
+                payload.push(0);
+            }
+        }
+        out.clear();
+        decode_i2s(&payload, &mut st, &mut out);
+        assert!(st.locked, "audio after silence has to lock");
+        assert_eq!(&out[..3], &[0x56, 0x34, 0x12]);
+    }
+
+    /// A new listener starts on a freshly aligned stream, not on whatever the
+    /// last one left half-decoded.
+    #[test]
+    fn a_reset_decoder_starts_over() {
+        let mut st = Rec::default();
+        let mut out = Vec::new();
+        decode_i2s(&[0x01, 0x00, 0x01, 0x00], &mut st, &mut out);
+        assert!(!st.locked, "four bytes cannot lock a phase");
+        assert!(!st.units.is_empty());
+        st.reset();
+        assert!(st.units.is_empty());
     }
 
     /// A PipeWire buffer and a pipe read both hand over whatever length they

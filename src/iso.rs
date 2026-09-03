@@ -533,8 +533,8 @@ extern "system" fn on_bulk_in(xfer: *mut ffi::libusb_transfer) {
                 if crate::audio::REC_ON.load(Ordering::Relaxed) {
                     let data = std::slice::from_raw_parts(t.buffer, t.actual_length as usize);
                     let mut pcm = Vec::with_capacity(data.len() / 21);
-                    if let Ok(mut a) = REC_ALIGN.lock() {
-                        crate::audio::decode_i2s(data, &mut a, &mut pcm);
+                    if let Ok(mut st) = REC_STATE.lock() {
+                        crate::audio::decode_i2s(data, &mut st, &mut pcm);
                     }
                     crate::audio::push_rec(&pcm);
                 }
@@ -748,13 +748,13 @@ pub fn stop_pcm_capture() {
     *PCM_DUMP.lock().unwrap() = None;
 }
 
-/// I2S bit phase on the audio-in pipe, found once and kept.
-static REC_ALIGN: Mutex<Option<usize>> = Mutex::new(None);
+/// Input decoder state: the bit phase, and the units not yet decoded.
+static REC_STATE: Mutex<crate::audio::Rec> = Mutex::new(crate::audio::Rec::new());
 
 /// Forget the capture alignment, so the next payload re-locks.
 pub fn reset_rec_align() {
-    if let Ok(mut a) = REC_ALIGN.lock() {
-        *a = None;
+    if let Ok(mut st) = REC_STATE.lock() {
+        st.reset();
     }
 }
 

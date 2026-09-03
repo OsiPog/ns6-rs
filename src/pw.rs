@@ -21,7 +21,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -90,6 +90,10 @@ fn run(alive: fn() -> bool) -> Result<(), pw::Error> {
     // it. Feeding it the instant the first buffer arrives means running with an
     // empty queue, where every scheduling jitter is a gap.
     let prefill = RATE as usize / 1000 * env("NS6_PLAY_MS", 40usize) * audio::OUT_FRAME;
+    // The same for the other direction, where the device is the producer: how
+    // much captured audio to sit on, so a late graph cycle has something to
+    // take rather than a hole.
+    let refill = RATE as usize / 1000 * env("NS6_REC_MS", 20usize) * audio::IN_FRAME;
 
     // The nodes' own ids, learned as they are bound. Only the daemon can say
     // what they are, and the graph below is described entirely in them.
@@ -163,17 +167,31 @@ fn run(alive: fn() -> bool) -> Result<(), pw::Error> {
         },
     )?;
     let _source_listener = source
-        .add_local_listener_with_user_data(Vec::<u8>::with_capacity(16 * 1024))
+        .add_local_listener_with_user_data(Capture::new(refill))
         .state_changed({
             let id = source_node.clone();
-            move |stream, _, _, new| {
+            move |stream, cap, _, new| {
                 id.set(stream.node_id());
                 if new != StreamState::Streaming {
                     audio::REC_ON.store(false, Ordering::Relaxed);
+                    // The next recorder may ask in quite different sized
+                    // pieces, and the queue is sized from what it asks for.
+                    cap.burst = 0;
                 }
             }
         })
-        .process(capture)
+        .io_changed(|_, cap, id, area, size| {
+            if id == spa::sys::SPA_IO_RateMatch {
+                cap.rate_match =
+                    if size as usize >= std::mem::size_of::<spa::sys::spa_io_rate_match>() {
+                        cap.offered = true;
+                        area.cast()
+                    } else {
+                        std::ptr::null_mut()
+                    };
+            }
+        })
+        .process(move |stream, cap| capture(stream, cap, refill))
         .register()?;
     source.connect(
         Direction::Output,
@@ -420,8 +438,97 @@ fn play(stream: &Stream, pb: &mut Playback, gain: f32, prefill: usize) {
     }
 }
 
+/// What the source carries between buffers.
+struct Capture {
+    /// Host frames, built here so the steady state allocates nothing.
+    host: Vec<u8>,
+    /// Where to ask the resampler for a slightly different rate, once the
+    /// adapter has given us the area to ask in. Null until then.
+    rate_match: *mut spa::sys::spa_io_rate_match,
+    /// Whether it was ever offered at all. A client speaking the device's own
+    /// rate may be given no resampler, and then there is nothing to ask.
+    offered: bool,
+    /// Queue depth, smoothed. See [`FILL_ALPHA`].
+    fill: f64,
+    /// The largest buffer this client has asked for, in bytes of decoded
+    /// frames. See [`Capture::target`].
+    burst: usize,
+    /// The correction currently being asked for, moved gently.
+    correction: f64,
+    matching: bool,
+}
+
+impl Capture {
+    fn new(target: usize) -> Self {
+        Self {
+            host: Vec::with_capacity(16 * 1024),
+            rate_match: std::ptr::null_mut(),
+            offered: false,
+            fill: target as f64,
+            burst: 0,
+            correction: 1.0,
+            matching: std::env::var("NS6_NO_RATE_MATCH").is_err(),
+        }
+    }
+
+    /// How much captured audio to hold, given what this client actually asks
+    /// for. The same argument as [`Playback::target`], from the other side.
+    fn target(&self, floor: usize) -> usize {
+        floor.max(self.burst * 3)
+    }
+}
+
+/// Ask the resampler to take frames a little faster or slower, to hold the
+/// capture queue at the depth it settled to.
+///
+/// The mirror of [`follow_the_device_clock`], and needed for the same reason:
+/// the device produces on its own crystal and the graph consumes on the
+/// graph's, so the queue between them integrates the difference. Measured
+/// here, idle, that difference is **+16.7 ppm** - the queue grows by a
+/// millisecond a minute. It is far slower than the output fault was, and
+/// nothing drops for the first few hours, which is exactly why it wants
+/// correcting rather than watching: a set long enough to reach the queue's
+/// 250 ms cap is an ordinary length of set.
+///
+/// The sign is the same as the playback side, which is not what it looks like
+/// it should be and was got wrong first: a `rate` below 1 makes the resampler
+/// ask *this* side for **more** frames, in both directions. Asking for more
+/// when the queue was already short drained it further, which fed back into
+/// asking for more still - the correction sat pinned at the -1% clamp with the
+/// graph consuming exactly 1% more than the device produced, and the shortfall
+/// written out as silence at 442 frames a second. A runaway in a loop this
+/// slow looks like a steady fault, so it is worth being able to see the
+/// number: the `capture loop:` line reports the correction being asked for.
+fn follow_the_device_clock_in(cap: &mut Capture, target: usize) {
+    if cap.rate_match.is_null() || !cap.matching || target == 0 {
+        return;
+    }
+    let fill = audio::rec_queued() as f64;
+    cap.fill += (fill - cap.fill) * FILL_ALPHA;
+
+    let error = (cap.fill - target as f64) / target as f64;
+    // Too full means the device is producing faster than the graph is taking,
+    // so the graph should take slightly more - which is what a rate below 1
+    // asks for.
+    let want = (1.0 - RATE_GAIN * error).clamp(1.0 - RATE_LIMIT, 1.0 + RATE_LIMIT);
+    cap.correction += (want - cap.correction).clamp(-RATE_SLEW, RATE_SLEW);
+    REC_CORRECTION.store(((cap.correction - 1.0) * 1e6) as i64, Ordering::Relaxed);
+    REC_TARGET.store(target as i64, Ordering::Relaxed);
+    unsafe {
+        (*cap.rate_match).rate = cap.correction;
+        (*cap.rate_match).flags |= spa::sys::SPA_IO_RATE_MATCH_FLAG_ACTIVE;
+    }
+}
+
+/// Whether the source was ever offered a rate-match area, for reporting.
+pub static REC_MATCHING: AtomicBool = AtomicBool::new(false);
+/// The correction the capture loop is asking for, in ppm, for reporting.
+pub static REC_CORRECTION: AtomicI64 = AtomicI64::new(0);
+/// The depth the capture loop is aiming at, in bytes, for reporting.
+pub static REC_TARGET: AtomicI64 = AtomicI64::new(0);
+
 /// Fill one buffer for the graph from what the device has sent.
-fn capture(stream: &Stream, host: &mut Vec<u8>) {
+fn capture(stream: &Stream, cap: &mut Capture, refill: usize) {
     let Some(mut buffer) = stream.dequeue_buffer() else {
         return;
     };
@@ -443,18 +550,28 @@ fn capture(stream: &Stream, host: &mut Vec<u8>) {
         requested.min(capacity)
     };
 
-    host.clear();
-    audio::to_host(&audio::take_rec(frames * audio::IN_FRAME), host);
-    let have = host.len();
-    slice[..have].copy_from_slice(host);
+    cap.host.clear();
+    audio::to_host(&audio::take_rec(frames * audio::IN_FRAME), &mut cap.host);
+    let have = cap.host.len();
+    slice[..have].copy_from_slice(&cap.host);
     // Short of what was asked for: the device has not sent it yet, and silence
-    // is the only honest thing to put in its place.
-    slice[have..frames * audio::HOST_FRAME].fill(0);
+    // is the only honest thing to put in its place - but it is still a gap,
+    // and a gap nobody counts is one nobody can be shown.
+    let want = frames * audio::HOST_FRAME;
+    slice[have..want].fill(0);
+    if have < want && audio::REC_ON.load(Ordering::Relaxed) {
+        let short = ((want - have) / audio::HOST_FRAME) as u64;
+        audio::REC_UNDERRUNS.fetch_add(short, Ordering::Relaxed);
+    }
 
     let chunk = data.chunk_mut();
     *chunk.offset_mut() = 0;
     *chunk.stride_mut() = audio::HOST_FRAME as i32;
     *chunk.size_mut() = (frames * audio::HOST_FRAME) as u32;
+
+    cap.burst = cap.burst.max(frames * audio::IN_FRAME);
+    REC_MATCHING.store(cap.offered, Ordering::Relaxed);
+    follow_the_device_clock_in(cap, cap.target(refill));
 }
 
 /// What each node carries: four channels out, two in.
