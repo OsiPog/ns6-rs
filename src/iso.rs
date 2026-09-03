@@ -16,9 +16,13 @@
 //! `isocWriteCompleteKeepAlive` machinery runs the isochronous side as a
 //! keep-alive that clocks the device. Driving bulk alone gets one buffer accepted
 //! and then permanent NAK, because nothing is clocking the engine.
+//!
+//! `0x81` is not only a keep-alive, though. It is an **explicit feedback
+//! endpoint**, and what it says has to be acted on: see [`feedback_frames`] and
+//! [`out_rate`].
 
 use std::os::raw::{c_int, c_uint, c_void};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use rusb::ffi;
 
@@ -44,12 +48,35 @@ const MICROFRAMES_PER_SEC: u64 = 8000;
 /// `InitFramePattern`; at 44.1 kHz that averages 44100/8000 = 5.5125 frames per
 /// microframe, so packets alternate between 5 and 6 frames. This reproduces the
 /// same average with a Bresenham accumulator rather than a precomputed table.
+///
+/// The rate it averages to is not the nominal 44100 but whatever the device is
+/// asking for - see [`out_rate`]. A table cannot do that, which is why this is
+/// an accumulator.
+///
+/// `rate` is in [`RATE_FRAC`]ths of a frame per second, not whole hertz. A
+/// whole hertz here is 23 ppm, which sounds like nothing and is not: whatever
+/// the rounding fails to send accumulates in the device's buffer exactly as
+/// the original mismatch did, only slower. One frame a second is a
+/// millisecond of buffer every 44 seconds, which is the same fault again with
+/// a longer fuse.
 fn next_frame_count(rate: u64) -> u64 {
     let acc = FRAME_ACC.fetch_add(rate, Ordering::Relaxed) + rate;
-    let frames = acc / MICROFRAMES_PER_SEC;
-    FRAME_ACC.fetch_sub(frames * MICROFRAMES_PER_SEC, Ordering::Relaxed);
+    let frames = frames_for(acc);
+    FRAME_ACC.fetch_sub(frames * PER_PACKET, Ordering::Relaxed);
     frames
 }
+
+/// The whole of the pattern: how many frames an accumulator has earned.
+fn frames_for(acc: u64) -> u64 {
+    acc / PER_PACKET
+}
+
+/// Accumulator units one packet is worth.
+const PER_PACKET: u64 = MICROFRAMES_PER_SEC * RATE_FRAC;
+
+/// Sub-hertz resolution on the OUT rate: it is carried in 256ths of a frame
+/// per second, which is 0.09 ppm.
+pub const RATE_FRAC: u64 = 256;
 
 /// Size every packet of an isochronous OUT transfer from the frame pattern.
 ///
@@ -60,14 +87,18 @@ unsafe fn size_out_packets(t: &mut ffi::libusb_transfer, bytes_per_frame: usize,
     let descs =
         std::slice::from_raw_parts_mut(t.iso_packet_desc.as_mut_ptr(), t.num_iso_packets as usize);
     let mut total = 0usize;
+    let mut frames = 0u64;
     for d in descs.iter_mut() {
-        let len = next_frame_count(rate) as usize * bytes_per_frame;
+        let n = next_frame_count(rate);
+        frames += n;
+        let len = n as usize * bytes_per_frame;
         d.length = len as c_uint;
         d.actual_length = 0;
         d.status = 0;
         total += len;
     }
     t.length = total as c_int;
+    OUT_FRAMES.fetch_add(frames, Ordering::Relaxed);
 }
 
 /// Bytes per audio frame on the isochronous OUT endpoint, and the sample rate.
@@ -90,6 +121,164 @@ const LIBUSB_TRANSFER_NO_DEVICE: c_int = 5;
 /// capture - waits forever for events that can no longer arrive. Far better to
 /// exit and let whoever started us start us again.
 pub static DEVICE_GONE: AtomicBool = AtomicBool::new(false);
+
+/* ------------------------------------------------ the feedback endpoint */
+
+/// Frames the device has asked for, cumulative, as read from isochronous IN
+/// `0x81`.
+///
+/// This pipe is not a keep-alive with nothing in it. It is an explicit feedback
+/// endpoint: one packet per millisecond whose first byte is the number of audio
+/// frames the device wants for that millisecond, `0x2c` or `0x2d` - 44 or 45,
+/// averaging 44.1. That average is the device's own crystal, reported by the
+/// device, and it is the only statement of it there is.
+pub static FB_FRAMES: AtomicU64 = AtomicU64::new(0);
+/// Feedback packets read.
+pub static FB_PACKETS: AtomicU64 = AtomicU64::new(0);
+/// Frames handed to the isochronous OUT pipe, cumulative.
+pub static OUT_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+/// Hex-dump this many more feedback packets, for reading the format off the
+/// wire rather than off a decompilation.
+static FB_DUMP_LEFT: AtomicU64 = AtomicU64::new(0);
+
+/// Dump the next `n` feedback packets.
+pub fn dump_feedback(n: u64) {
+    FB_DUMP_LEFT.store(n, Ordering::Relaxed);
+}
+
+/// Read one feedback packet and add what it asks for to [`FB_FRAMES`].
+///
+/// libusb packs isochronous IN packets at the *requested* length, which for
+/// this endpoint is never resized, so packet `index` starts at
+/// `index * iso_packet_desc[0].length`.
+unsafe fn take_feedback(t: &ffi::libusb_transfer, index: usize, len: usize) {
+    let stride = (*t.iso_packet_desc.as_ptr()).length as usize;
+    let data = std::slice::from_raw_parts(t.buffer.add(index * stride), len);
+
+    let left = FB_DUMP_LEFT.load(Ordering::Relaxed);
+    if left > 0 {
+        FB_DUMP_LEFT.store(left - 1, Ordering::Relaxed);
+        let hex: Vec<String> = data.iter().map(|b| format!("{b:02X}")).collect();
+        eprintln!("  feedback[{len}B]: {}", hex.join(" "));
+    }
+
+    if let Some(frames) = feedback_frames(data) {
+        FB_FRAMES.fetch_add(frames, Ordering::Relaxed);
+        FB_PACKETS.fetch_add(1, Ordering::Relaxed);
+        note_feedback_rate(frames);
+    }
+}
+
+/// Frames asked for by one feedback packet.
+///
+/// The packet is three bytes, and they are the last three counts with the
+/// newest first - which the device's own first packets spell out: `05 00 00`,
+/// then `2C 05 00`, then `2C 2C 05`, then `2C 2C 2C`. So only the first byte
+/// is new; the other two were already counted when they were, and adding them
+/// again would treble the rate.
+///
+/// A value nowhere near a millisecond of audio is not a count at all - the
+/// window is still filling - and is thrown away rather than being allowed to
+/// steer the output rate off a zero.
+pub fn feedback_frames(data: &[u8]) -> Option<u64> {
+    let n = *data.first()? as u64;
+    (FB_FRAMES_MIN..=FB_FRAMES_MAX).contains(&n).then_some(n)
+}
+
+/// The range a feedback count may plausibly take: 44.1 kHz is 44 or 45 frames
+/// per millisecond, and a few percent either side of that is still a rate.
+const FB_FRAMES_MIN: u64 = 40;
+const FB_FRAMES_MAX: u64 = 49;
+
+/// The rate the device is asking for, smoothed: frames per second in
+/// [`FB_RATE_SHIFT`] fixed point. Zero until the first packet is read.
+static FB_RATE: AtomicI64 = AtomicI64::new(0);
+
+/// Feedback packets to see before [`out_rate`] will believe [`FB_RATE`].
+///
+/// The first few say `05 00 00`, `2C 05 00`, `2C 2C 05`: the packet carries the
+/// last three counts, newest first, and the window has to fill before the
+/// numbers in it are counts of anything.
+const FB_WARMUP: u64 = 200;
+
+/// Fixed-point shift on [`FB_RATE`], so a rate a fraction of a hertz off
+/// nominal is still representable in an integer. Wider than [`RATE_FRAC`],
+/// because the average it holds is of numbers only ever 44 or 45: all of the
+/// rate is in the fraction.
+const FB_RATE_SHIFT: u32 = 20;
+
+/// How much of each packet's count to believe.
+///
+/// The counts themselves are only ever 44 or 45; the rate is in the proportion
+/// of one to the other, so it only exists as an average. At one packet per
+/// millisecond a shift of 10 averages over about a second - fast enough to
+/// follow the device's own correction, which moves over tens of seconds, and
+/// slow enough that the pattern does not jitter with the last packet received.
+const FB_RATE_SHIFT_ALPHA: u32 = 10;
+
+/// Fold one feedback count into the smoothed rate.
+fn note_feedback_rate(frames: u64) {
+    let r = FB_RATE.load(Ordering::Relaxed);
+    FB_RATE.store(blend_rate(r, frames), Ordering::Relaxed);
+}
+
+/// One step of that average, in [`FB_RATE_SHIFT`] fixed point.
+fn blend_rate(prev: i64, frames: u64) -> i64 {
+    // A count is frames per millisecond; a rate is frames per second.
+    let v = ((frames * 1000) as i64) << FB_RATE_SHIFT;
+    // The first packet has nothing to average with, so it is the average.
+    if prev == 0 {
+        v
+    } else {
+        prev + ((v - prev) >> FB_RATE_SHIFT_ALPHA)
+    }
+}
+
+/// The rate the isochronous OUT pattern should average to, in frames/s.
+///
+/// **This is the fix for the distortion that arrives partway through a long
+/// tone.** The device has its own crystal and its own buffer, and it says on
+/// `0x81` how many frames a millisecond it wants. Sending the nominal 44100
+/// instead - a fixed pattern computed from the host's microframe clock - leaves
+/// that request unanswered, so the device's buffer level is whatever the
+/// difference between two independent clocks has integrated to. Measured here,
+/// it did not merely drift: the device kept adjusting what it asked for,
+/// nothing adjusted, and `asked - sent` swung +-1500 frames - +-34 ms of
+/// buffer - on a cycle of about a minute. That is far more than the device
+/// holds, so it wraps, and a wrap in the middle of a steady tone is a burst of
+/// gross distortion. Roughly once a minute, which is exactly when it was heard.
+///
+/// Answering the request closes the loop the device is already trying to run:
+/// give it the rate it asks for and its own correction settles, because the
+/// thing it was correcting for has gone.
+///
+/// `nominal` is in whole frames per second; the answer is in [`RATE_FRAC`]ths
+/// of one. Nominal is used until the feedback has been running long enough to
+/// mean anything, and the answer is clamped to [`FB_RATE_TOLERANCE`] of it,
+/// because a rate wildly off nominal is a misread packet rather than a crystal.
+pub fn out_rate(nominal: u64) -> u64 {
+    let floor = nominal * RATE_FRAC;
+    if NO_FEEDBACK.load(Ordering::Relaxed) || FB_PACKETS.load(Ordering::Relaxed) < FB_WARMUP {
+        return floor;
+    }
+    let rate = (FB_RATE.load(Ordering::Relaxed) as u64 * RATE_FRAC) >> FB_RATE_SHIFT;
+    let slack = floor * FB_RATE_TOLERANCE / 100;
+    rate.clamp(floor - slack, floor + slack)
+}
+
+/// How far from nominal the device is allowed to ask for, as a percentage.
+///
+/// Two clocks a few percent apart are not two crystals, so a number out here
+/// is a bug on this side and must not be allowed to drive the hardware.
+const FB_RATE_TOLERANCE: u64 = 2;
+
+/// Set to ignore the feedback endpoint and send the nominal rate, which is what
+/// this driver did before the rate was measured rather than assumed.
+///
+/// Kept because the difference is only visible against hardware, and a claim
+/// about hardware wants to be checkable in one run.
+pub static NO_FEEDBACK: AtomicBool = AtomicBool::new(false);
 
 /// One submitted isochronous transfer, together with the buffer it points at.
 struct IsoTransfer {
@@ -119,6 +308,13 @@ extern "system" fn on_complete(xfer: *mut ffi::libusb_transfer) {
                     ISO_IN_OK.fetch_add(1, Ordering::Relaxed);
                     if d.actual_length > 0 {
                         ISO_IN_DATA.fetch_add(d.actual_length as u64, Ordering::Relaxed);
+                        // Only `0x81` carries the rate. Any other isochronous
+                        // IN pipe added later would be some other kind of
+                        // payload, and taking it for a frame count would steer
+                        // the hardware off it silently.
+                        if t.endpoint == crate::protocol::EP_ISO_IN {
+                            take_feedback(t, i, d.actual_length as usize);
+                        }
                         if ISO_IN_DUMP.load(Ordering::Relaxed) {
                             dump_iso_in(t, i, d.actual_length as usize);
                         }
@@ -136,7 +332,7 @@ extern "system" fn on_complete(xfer: *mut ffi::libusb_transfer) {
                 let bpf = OUT_BYTES_PER_FRAME.load(Ordering::Relaxed) as usize;
                 let rate = OUT_RATE.load(Ordering::Relaxed);
                 if bpf > 0 && rate > 0 {
-                    size_out_packets(&mut *xfer, bpf, rate);
+                    size_out_packets(&mut *xfer, bpf, out_rate(rate));
                     if crate::audio::PLAY_ON.load(Ordering::Relaxed) {
                         fill_out_pcm(&mut *xfer);
                     } else if TONE_ON.load(Ordering::Relaxed) {
@@ -225,7 +421,7 @@ impl IsoStream {
 
                 // OUT packets carry only as much audio as the sample rate calls for.
                 if let Some((bytes_per_frame, rate)) = frame_pattern {
-                    size_out_packets(t, bytes_per_frame, rate);
+                    size_out_packets(t, bytes_per_frame, out_rate(rate));
                     if TONE_ON.load(Ordering::Relaxed) {
                         fill_out_tone(t, bytes_per_frame);
                     }
@@ -594,5 +790,93 @@ unsafe fn dump_out(frames: &[u8]) {
                 OUT_DUMP_BYTES.fetch_add(frames.len() as u64, Ordering::Relaxed);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The device's first feedback packets are `05 00 00`, `2C 05 00`,
+    /// `2C 2C 05`: the packet is a sliding window of the last three counts,
+    /// newest first, and until it has filled the bytes in it are not counts.
+    /// Letting one through would steer the output rate off a zero.
+    #[test]
+    fn only_plausible_feedback_counts_are_believed() {
+        assert_eq!(feedback_frames(&[0x2C, 0x2C, 0x2C]), Some(44));
+        assert_eq!(feedback_frames(&[0x2D, 0x2C, 0x2C]), Some(45));
+        assert_eq!(feedback_frames(&[0x05, 0x00, 0x00]), None);
+        assert_eq!(feedback_frames(&[0x00, 0x00, 0x00]), None);
+        assert_eq!(feedback_frames(&[]), None);
+    }
+
+    /// The rate the device asks for is not a whole number of hertz, and the
+    /// pattern has to average to it anyway: whatever it fails to send
+    /// accumulates in the device's buffer exactly as the original mismatch
+    /// did, only slower.
+    #[test]
+    fn the_frame_pattern_averages_a_fractional_rate() {
+        for hz in [44_100.0f64, 44_101.6, 44_099.25, 44_102.87] {
+            let rate = (hz * RATE_FRAC as f64) as u64;
+            let mut acc = 0u64;
+            let mut total = 0u64;
+            for _ in 0..MICROFRAMES_PER_SEC {
+                acc += rate;
+                let n = frames_for(acc);
+                acc -= n * PER_PACKET;
+                assert!(
+                    (5..=6).contains(&n),
+                    "implausible packet at {hz} Hz: {n} frames"
+                );
+                total += n;
+            }
+            assert_eq!(
+                total,
+                rate / RATE_FRAC,
+                "one second of packets must carry one second of audio at {hz} Hz"
+            );
+        }
+    }
+
+    /// The counts are only ever 44 or 45, so the rate the device is asking for
+    /// exists only as the proportion of one to the other, and has to be
+    /// averaged out of them rather than read off one.
+    #[test]
+    fn the_smoothed_rate_settles_on_the_average_count() {
+        // 44.1 kHz is nine 44s to every 45.
+        let mut r = 0i64;
+        for i in 0..200_000u64 {
+            r = blend_rate(r, if i % 10 == 0 { 45 } else { 44 });
+        }
+        let hz = (r >> FB_RATE_SHIFT) as f64;
+        assert!((hz - 44_100.0).abs() < 5.0, "settled on {hz} Hz, not 44100");
+    }
+
+    /// A number out past the tolerance is this side misreading the pipe, not a
+    /// crystal, and must not reach the hardware. Nor may an unread pipe leave
+    /// the nominal rate behind.
+    #[test]
+    fn a_wild_rate_cannot_drive_the_hardware() {
+        let nominal = 44_100u64;
+        let floor = nominal * RATE_FRAC;
+        let slack = floor * FB_RATE_TOLERANCE / 100;
+
+        // Nothing read yet: the nominal rate, exactly.
+        FB_PACKETS.store(0, Ordering::Relaxed);
+        assert_eq!(out_rate(nominal), floor);
+
+        FB_PACKETS.store(FB_WARMUP, Ordering::Relaxed);
+        FB_RATE.store(60_000i64 << FB_RATE_SHIFT, Ordering::Relaxed);
+        assert_eq!(out_rate(nominal), floor + slack);
+        FB_RATE.store(8_000i64 << FB_RATE_SHIFT, Ordering::Relaxed);
+        assert_eq!(out_rate(nominal), floor - slack);
+
+        // And the switch back to what this driver used to do still works.
+        NO_FEEDBACK.store(true, Ordering::Relaxed);
+        assert_eq!(out_rate(nominal), floor);
+
+        NO_FEEDBACK.store(false, Ordering::Relaxed);
+        FB_PACKETS.store(0, Ordering::Relaxed);
+        FB_RATE.store(0, Ordering::Relaxed);
     }
 }

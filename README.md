@@ -24,6 +24,7 @@ Working, both the control surface and the audio.
 | Audio out: a sine written to the iso pipe comes out of the device | done, measured |
 | Audio in: the input bitstream decoded to PCM | done, measured |
 | Publishes its own PipeWire sink and source | done, plays and records |
+| Output rate locked to the device's own clock | done, from the feedback endpoint |
 | ALSA MIDI port visible to Mixxx/PortMidi | done, verified with `aseqdump` |
 | Control surface enumerated (`ns6 learn`) | done |
 | Mixxx mapping | in progress |
@@ -301,11 +302,44 @@ Tuning:
 | `NS6_PLAY`, `NS6_REC` | unset | Stream through these paths instead of publishing nodes. |
 | `NS6_NO_PIPEWIRE` | unset | Publish nothing; MIDI only. |
 | `NS6_PW_DEBUG` | unset | Say when either node gains or loses its last link. |
+| `NS6_NO_FEEDBACK` | unset | Send the nominal 44100 and ignore the rate the device asks for. |
+| `NS6_FB_DUMP` | unset | Hex-dump this many feedback packets, then stop. |
+| `NS6_OUT_DUMP` | unset | Write every wire frame handed to the device to this path. |
 
-Round trip through the hardware measures 10-30 ms. Nothing resamples: the device's
-clock and the host's are independent, so a long session will eventually drift. Over
-half a minute the measured rate holds at 44.09-44.13 kHz and underruns stay at a few
-milliseconds, all of them at start-up.
+Round trip through the hardware measures 10-30 ms.
+
+### The device's clock is the one that counts
+
+The device has its own crystal, and it says what it wants: isochronous IN `0x81`
+is an **explicit feedback endpoint**, answering one byte per millisecond with the
+number of frames to send for that millisecond. The driver sends that rate rather
+than the nominal 44100, and PipeWire's resampler is then steered to keep the
+queue that feeds it at a constant depth. So the whole chain runs on the device's
+clock and nothing drifts.
+
+It has to be that way round. Sending a fixed 44100 - a pattern computed from the
+*host's* microframe clock - leaves the request unanswered, and the difference
+between two independent clocks accumulates inside the device, where nothing on
+the host can see it. That is not a slow drift: the device runs a correction of
+its own, and with nothing answering it, frames-sent-minus-frames-asked-for swung
+over about 6500 frames - **147 ms of the device's buffer** - on a cycle of half a
+minute or so. Far more buffer than it has, so it wraps, and a wrap in the middle
+of a steady tone is a burst of gross distortion, once a minute or thereabouts.
+Answering the request settles the device's own correction and holds the
+difference to 53 frames - 1.2 ms - over three minutes.
+
+The driver reports it, because the only way to see any of this is from both sides
+at once:
+
+```
+clock: device asks 44101.10 Hz over 125018 ms, sending 44099.73 Hz; sent - asked = 641 frames
+```
+
+That last number staying put is the whole of it. `NS6_NO_FEEDBACK=1` sends the
+nominal rate instead, which is what this driver did before the pipe was read, and
+is how the two are compared in one run on the same binary.
+
+Underruns stay at a few milliseconds, all of them at start-up.
 
 ### After a power cycle, wait
 

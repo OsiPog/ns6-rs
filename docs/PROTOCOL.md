@@ -240,9 +240,54 @@ submission.
 
 The iso OUT packet lengths alternate 72 and 60 bytes — 6 and 5 audio frames of
 12 bytes — with an extra 72 roughly every 40 packets. That averages 5.5125
-frames per microframe, which is 44100/8000. The feedback endpoint answers with
-one byte per millisecond, `0x2c` or `0x2d`: 44 or 45 frames, the same rate seen
-from the other side.
+frames per microframe, which is 44100/8000.
+
+### `0x81` is explicit feedback, and it has to be answered
+
+The isochronous IN pipe is described above as a keep-alive, and it is not only
+that. It answers one three-byte packet per millisecond, and those bytes are the
+**last three per-millisecond frame counts, newest first**. The device's own
+first packets spell the format out, because the window starts empty:
+
+```
+05 00 00
+2C 05 00
+2C 2C 05
+2C 2C 2C
+```
+
+`0x2c`/`0x2d` is 44 or 45 frames. Their proportion is the rate: the device is
+saying, a millisecond at a time, how much audio it wants. Only the first byte of
+each packet is new — the other two were already counted when they were new, and
+adding them again would treble the rate.
+
+**Sending the nominal 44100 instead of what it asks for is audible.** A fixed
+pattern is computed against the *host's* microframe clock; the device's DAC runs
+off its own crystal and its own buffer, and the difference integrates there,
+where nothing on the host can see it. Measured on hardware, over three minutes
+with a 60 Hz tone playing:
+
+| | frames sent minus frames asked for |
+|---|---|
+| nominal 44100, feedback ignored | +787 → −1145 → +3111 → +5388: about 6500 frames of excursion, 147 ms, cycling every 30–60 s |
+| the rate the device asks for | 684 → 631: 53 frames, 1.2 ms, over the whole run |
+
+It does not merely drift. The device keeps adjusting what it asks for — it is
+running a correction of its own — and with nothing on this side answering, the
+two walk around each other. 147 ms is far more buffer than the device has, so it
+wraps, and a wrap in the middle of a steady tone is a burst of gross distortion:
+roughly once a minute, which is where it was heard.
+
+Answering closes the loop the device was already trying to run. Given the rate it
+asks for, its own correction settles — it stops asking for anything else, at
+44101.1 Hz, and stays there.
+
+Two details matter in the answering. The rate only exists as the average of a
+sequence of 44s and 45s, so it has to be averaged out of them — about a second's
+worth — rather than read off the last packet. And the average has to be carried
+with **sub-hertz resolution**: a whole hertz is 23 ppm, and 23 ppm is a
+millisecond of the device's buffer every 44 seconds, which is the same fault
+again with a longer fuse. `src/iso.rs` keeps it in 256ths of a frame per second.
 
 ## Gotchas
 

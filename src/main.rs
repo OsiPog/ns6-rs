@@ -262,6 +262,17 @@ fn cmd_run(mode: Mode) -> Result<(), Box<dyn std::error::Error>> {
         iso::dump_out_to(&path)?;
         println!("dumping wire frames to {path}");
     }
+    // The feedback endpoint's own bytes, for reading its format off the wire.
+    if let Ok(n) = std::env::var("NS6_FB_DUMP") {
+        iso::dump_feedback(n.parse().unwrap_or(32));
+    }
+    // Send the nominal rate and ignore what the device asks for, which is what
+    // this driver did before the feedback endpoint was read. Kept because the
+    // difference between the two is only visible against hardware.
+    if std::env::var("NS6_NO_FEEDBACK").is_ok() {
+        iso::NO_FEEDBACK.store(true, Ordering::Relaxed);
+        println!("feedback: ignored, sending the nominal rate");
+    }
     let audio_paths = AudioPaths::from_env();
     let no_pipewire = std::env::var("NS6_NO_PIPEWIRE").is_ok();
     let with_audio = audio_paths.any() || !no_pipewire;
@@ -440,6 +451,7 @@ fn cmd_run(mode: Mode) -> Result<(), Box<dyn std::error::Error>> {
             );
             if with_audio {
                 println!("  {}", audio_status());
+                println!("  {}", clock_status());
             }
             if !warned && ok == 0 && err > 0 {
                 warned = true;
@@ -2190,6 +2202,30 @@ fn is_fifo(path: &str) -> bool {
 }
 
 /// Frame counters at the last status print, for the rate estimate.
+/// What the device says its clock is doing, and whether the isochronous OUT
+/// pipe is keeping up with it.
+///
+/// `asked` is the device's own count of the frames it wants, read off the
+/// feedback endpoint; `sent` is what the OUT pipe actually sized itself for.
+/// The two are one clock only for as long as the difference between them stays
+/// put. Left to itself it does not: see `iso::out_rate`, where answering the
+/// request is the whole of the fix for a tone that breaks up partway through.
+fn clock_status() -> String {
+    let asked = iso::FB_FRAMES.load(Ordering::Relaxed);
+    let sent = iso::OUT_FRAMES.load(Ordering::Relaxed);
+    let packets = iso::FB_PACKETS.load(Ordering::Relaxed);
+    let rate = if packets > 0 {
+        asked as f64 * 1000.0 / packets as f64
+    } else {
+        0.0
+    };
+    format!(
+        "clock: device asks {rate:.2} Hz over {packets} ms, sending {:.2} Hz; sent - asked = {} frames",
+        iso::out_rate(p::SAMPLE_RATE as u64) as f64 / iso::RATE_FRAC as f64,
+        sent as i64 - asked as i64,
+    )
+}
+
 static LAST_STATUS: Mutex<Option<(Instant, u64, u64)>> = Mutex::new(None);
 
 /// One line of audio state, for the periodic status print.
