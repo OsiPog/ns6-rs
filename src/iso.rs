@@ -141,6 +141,8 @@ extern "system" fn on_complete(xfer: *mut ffi::libusb_transfer) {
                         fill_out_pcm(&mut *xfer);
                     } else if TONE_ON.load(Ordering::Relaxed) {
                         fill_out_tone(&mut *xfer, bpf);
+                    } else {
+                        silence_out(&mut *xfer);
                     }
                 }
             }
@@ -511,6 +513,26 @@ unsafe fn fill_out_tone(t: &mut ffi::libusb_transfer, bytes_per_frame: usize) {
         }
     }
     TONE_PHASE.store(n, Ordering::Relaxed);
+    dump_out(std::slice::from_raw_parts(t.buffer, t.length as usize));
+}
+
+/// Wire frames as handed to the isochronous OUT pipe, when dumping.
+///
+/// The last place the audio exists before the device has it, which is where a
+/// question about what the device is actually being sent has to be answered.
+/// Everything upstream - the graph, the resampler, the queue - can be measured
+/// some other way; this cannot.
+pub static OUT_DUMP: Mutex<Option<std::fs::File>> = Mutex::new(None);
+/// Bytes written to that file.
+pub static OUT_DUMP_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Start writing every frame sent to the device to `path`.
+///
+/// 12 bytes per frame: four 24-bit little-endian slots, master then phones.
+pub fn dump_out_to(path: &str) -> std::io::Result<()> {
+    let f = std::fs::File::create(path)?;
+    *OUT_DUMP.lock().unwrap() = Some(f);
+    Ok(())
 }
 
 /// Raw bulk IN 0x86 payloads, written straight to a file when capturing.
@@ -541,8 +563,36 @@ pub fn reset_rec_align() {
 }
 
 /// Fill a sized OUT transfer from the playback queue.
+/// Write silence into an isochronous OUT transfer.
+///
+/// Not filling a transfer is not the same as sending nothing. The buffer is
+/// resubmitted exactly as it stands, so whatever was last written to it goes
+/// out of the device again, and again: a few packets of old audio looping at
+/// packet rate, which is heard as a steady buzz for as long as the driver runs.
+/// Silence is a thing that has to be written.
+unsafe fn silence_out(t: &mut ffi::libusb_transfer) {
+    std::slice::from_raw_parts_mut(t.buffer, t.length as usize).fill(0);
+}
+
 unsafe fn fill_out_pcm(t: &mut ffi::libusb_transfer) {
     let len = t.length as usize;
     let dst = std::slice::from_raw_parts_mut(t.buffer, len);
     crate::audio::take_play(dst);
+    dump_out(dst);
+}
+
+/// Write what is about to go out to the dump file, if one was opened.
+///
+/// Called from the completion callback, so it does block on a file - which is
+/// why it only happens when asked for, and why the file wants to be somewhere
+/// fast.
+unsafe fn dump_out(frames: &[u8]) {
+    use std::io::Write;
+    if let Ok(mut slot) = OUT_DUMP.lock() {
+        if let Some(f) = slot.as_mut() {
+            if f.write_all(frames).is_ok() {
+                OUT_DUMP_BYTES.fetch_add(frames.len() as u64, Ordering::Relaxed);
+            }
+        }
+    }
 }

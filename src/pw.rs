@@ -110,7 +110,7 @@ fn run(alive: fn() -> bool) -> Result<(), pw::Error> {
         },
     )?;
     let _sink_listener = sink
-        .add_local_listener_with_user_data(Playback::new())
+        .add_local_listener_with_user_data(Playback::new(prefill))
         .state_changed({
             let id = sink_node.clone();
             move |stream, pb, _, new| {
@@ -122,7 +122,22 @@ fn run(alive: fn() -> bool) -> Result<(), pw::Error> {
                     audio::PLAY_ON.store(false, Ordering::Relaxed);
                     audio::clear_play();
                     pb.carry.clear();
+                    // The next client may deliver in quite different sized
+                    // pieces, and the queue is sized from what it sees.
+                    pb.burst = 0;
                 }
+            }
+        })
+        .io_changed(|_, pb, id, area, size| {
+            // The adapter hands over the rate-match area once it has decided it
+            // is resampling for us, and takes it away again when it stops.
+            if id == spa::sys::SPA_IO_RateMatch {
+                pb.rate_match =
+                    if size as usize >= std::mem::size_of::<spa::sys::spa_io_rate_match>() {
+                        area.cast()
+                    } else {
+                        std::ptr::null_mut()
+                    };
             }
         })
         .process(move |stream, pb| play(stream, pb, gain, prefill))
@@ -267,14 +282,105 @@ struct Playback {
     carry: Vec<u8>,
     /// Wire frames, built here so the steady state allocates nothing.
     wire: Vec<u8>,
+    /// Where to ask the resampler for a slightly different rate, once the
+    /// adapter has given us the area to ask in. Null until then.
+    rate_match: *mut spa::sys::spa_io_rate_match,
+    /// Queue depth, smoothed. See [`FILL_ALPHA`].
+    fill: f64,
+    /// The largest buffer this client has handed over recently, in bytes of
+    /// wire frames. See [`Playback::target`].
+    burst: usize,
+    /// The correction currently being asked for, moved gently.
+    correction: f64,
+    /// Whether to ask at all. Off is the old behaviour, kept because this is
+    /// the kind of loop that has to be provable against the hardware.
+    matching: bool,
 }
 
 impl Playback {
-    fn new() -> Self {
+    fn new(target: usize) -> Self {
         Self {
             carry: Vec::with_capacity(16 * 1024),
             wire: Vec::with_capacity(24 * 1024),
+            rate_match: std::ptr::null_mut(),
+            fill: target as f64,
+            burst: 0,
+            correction: 1.0,
+            matching: std::env::var("NS6_NO_RATE_MATCH").is_err(),
         }
+    }
+
+    /// How much audio to hold, given what this client actually delivers.
+    ///
+    /// `NS6_PLAY_MS` is a floor, not the answer. What matters is the size of
+    /// the pieces the graph actually delivers in, because the device drains
+    /// continuously while they arrive one per cycle: the queue swings by a
+    /// whole delivery every cycle, and by two when one runs late. Measured
+    /// here, that swing was 5 ms to 52 ms around a 28 ms average - so it hit
+    /// empty, and an empty queue is written out as silence, which steps the
+    /// waveform to zero and back. That is the clicking.
+    ///
+    /// Three deliveries of headroom keeps the trough clear of zero with a late
+    /// cycle to spare. It costs latency, which is why it is measured from what
+    /// arrives rather than guessed at: a client delivering 21 ms gets 63 ms,
+    /// not the 200 ms a badly behaved one would need.
+    fn target(&self, floor: usize) -> usize {
+        floor.max(self.burst * 3)
+    }
+}
+
+/// How hard to pull the queue back towards its target depth.
+///
+/// The queue is an integrator - a rate error accumulates in it - so a plain
+/// proportional term is enough and settles at a small standing offset instead
+/// of hunting. The drift being corrected here measures around 0.4%, so a
+/// standing offset of a few percent of the target is nothing.
+const RATE_GAIN: f64 = 0.05;
+
+/// The most correction that will ever be asked for, either way.
+///
+/// Two clocks that are 1% apart are not drifting, they are a bug somewhere
+/// else, and a runaway controller must not be able to hide it.
+const RATE_LIMIT: f64 = 0.01;
+
+/// How much of the measured depth to believe each cycle.
+///
+/// The raw depth is useless to steer on: it drops by a whole quantum as the
+/// device drains it and jumps back up when the next buffer arrives, so it
+/// swings by tens of milliseconds every cycle. Steering on that modulates the
+/// resampling ratio at graph rate, which is heard as dirt on the audio - most
+/// obviously on a low tone, where the modulation is a large part of a period.
+/// Drift, in contrast, is a thing that changes over minutes.
+const FILL_ALPHA: f64 = 0.005;
+
+/// The most the correction may move in one cycle.
+///
+/// A resampling ratio that steps is a click. There is no hurry: nothing being
+/// corrected here changes faster than a crystal warms up.
+const RATE_SLEW: f64 = 0.000_05;
+
+/// Ask the resampler to run a little slow or a little fast, to hold the
+/// device's queue at the depth it was primed to.
+///
+/// This is the whole answer to the clock problem. The device's crystal and the
+/// graph's are independent, nothing else here resamples, and without this the
+/// queue walks steadily to one end: to the 250 ms cap, where frames are dropped
+/// once a minute, or to empty, where they are made up as silence.
+fn follow_the_device_clock(pb: &mut Playback, target: usize) {
+    if pb.rate_match.is_null() || !pb.matching || target == 0 {
+        return;
+    }
+    let fill = audio::play_queued() as f64;
+    pb.fill += (fill - pb.fill) * FILL_ALPHA;
+
+    let error = (pb.fill - target as f64) / target as f64;
+    // Too full means the resampler is handing us frames faster than the device
+    // is taking them, so it should hand us slightly fewer.
+    let want = (1.0 - RATE_GAIN * error).clamp(1.0 - RATE_LIMIT, 1.0 + RATE_LIMIT);
+    pb.correction += (want - pb.correction).clamp(-RATE_SLEW, RATE_SLEW);
+    unsafe {
+        (*pb.rate_match).rate = pb.correction;
+        (*pb.rate_match).flags |= spa::sys::SPA_IO_RATE_MATCH_FLAG_ACTIVE;
     }
 }
 
@@ -301,12 +407,16 @@ fn play(stream: &Stream, pb: &mut Playback, gain: f32, prefill: usize) {
     pb.wire.clear();
     let used = audio::encode_host_quad(&pb.carry, gain, &mut pb.wire);
     pb.carry.drain(..used);
+    pb.burst = pb.burst.max(pb.wire.len());
     audio::push_play(&pb.wire);
 
+    let target = pb.target(prefill);
     // `PLAY_ON` doubles as the primed flag: until enough is in hand the device
     // is left on silence, and once it is playing there is nothing to decide.
-    if !audio::PLAY_ON.load(Ordering::Relaxed) && audio::play_queued() >= prefill {
+    if !audio::PLAY_ON.load(Ordering::Relaxed) && audio::play_queued() >= target {
         audio::PLAY_ON.store(true, Ordering::Relaxed);
+    } else {
+        follow_the_device_clock(pb, target);
     }
 }
 

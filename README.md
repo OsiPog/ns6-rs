@@ -240,6 +240,37 @@ In Mixxx, pick this one device and assign **Master → channels 1-2** and
 **Headphones → channels 3-4**. A plain stereo application lands on 1-2, so a
 browser plays out of the master and not into somebody's ears.
 
+#### Mixxx has to reach the sink directly
+
+Mixxx offers only the ALSA API here, where the device to choose is `pipewire`.
+That device does not have a fixed channel count: PipeWire's ALSA plugin takes the
+count from whatever node the stream is *routed to at the moment it is created*.
+Point it at the NS6 and it makes four ports; let anything stereo intercept it and
+it makes two, folding channels 3-4 into 1-2 inside the plugin - before PipeWire
+sees them at all. Mixxx then looks correctly configured while everything comes out
+of the master, and no setting inside Mixxx can help, because the damage is done
+before its audio reaches the graph.
+
+So the NS6 has to be the **default sink** when Mixxx opens the device, with nothing
+stereo in between. The usual culprit is an effects host: Easy Effects with "process
+all output streams" enabled captures every new stream into its own stereo sink, and
+that is enough to break this. Turning that off, with the NS6 as the default sink,
+is all it takes.
+
+Check it rather than trusting it - four ports means four channels:
+
+```sh
+pw-link -Io | grep mixxx        # four: output_FL, FR, RL, RR
+pw-link -Il | grep -A2 mixxx    # each landing on ns6:playback_FL/FR/RL/RR
+```
+
+Two ports means the fold already happened. Failing all else, a stream can be aimed
+at the sink explicitly, though only by node id, which is assigned afresh each run:
+
+```sh
+PIPEWIRE_NODE=$(pw-dump ns6 | grep -m1 '"id"' | grep -oE '[0-9]+') mixxx
+```
+
 This is only true with the controller's panel switched to **PC**. In that mode its
 faders, EQ and cue buttons send MIDI and stop touching the audio path — the mixing
 is the host's job, and these two feeds are what the host sends back. The knobs that

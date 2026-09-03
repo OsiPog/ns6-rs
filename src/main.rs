@@ -256,6 +256,12 @@ fn cmd_run(mode: Mode) -> Result<(), Box<dyn std::error::Error>> {
     // through it. Naming a path takes the audio side over instead: that is what
     // `NS6_PLAY`/`NS6_REC` are for, and a pipe or a file is still how to get at
     // the streams on a machine with no sound server at all.
+    // The last look at the audio before the device has it, for when a question
+    // about what is actually being sent cannot be answered any other way.
+    if let Ok(path) = std::env::var("NS6_OUT_DUMP") {
+        iso::dump_out_to(&path)?;
+        println!("dumping wire frames to {path}");
+    }
     let audio_paths = AudioPaths::from_env();
     let no_pipewire = std::env::var("NS6_NO_PIPEWIRE").is_ok();
     let with_audio = audio_paths.any() || !no_pipewire;
@@ -1966,6 +1972,10 @@ fn cmd_audio() -> Result<(), Box<dyn std::error::Error>> {
 
     let (dev, _streams) = open_for_output()?;
     install_signal_handler();
+    if let Ok(path) = std::env::var("NS6_OUT_DUMP") {
+        iso::dump_out_to(&path)?;
+        println!("dumping wire frames to {path}");
+    }
 
     if let Some(path) = &dump {
         iso::capture_pcm_to(path)?;
@@ -2209,9 +2219,16 @@ fn audio_status() -> String {
         *last = Some((now, out, inn));
     }
     format!(
-        "audio: {out} frames out ({} underruns), {inn} frames in ({} dropped){rates}",
+        "audio: {out} frames out ({} underruns, {} dropped), {inn} frames in ({} dropped){rates}  queue {:.0} ms",
         audio::PLAY_UNDERRUNS.load(Ordering::Relaxed),
+        // Drops mean the host is running ahead of the device's own clock, so
+        // this counter is the drift made visible: nothing here resamples.
+        audio::PLAY_DROPS.load(Ordering::Relaxed),
         audio::REC_OVERRUNS.load(Ordering::Relaxed),
+        // Where the rate matching has settled. It should sit near NS6_PLAY_MS
+        // and stay there; a queue walking towards 250 ms or towards nothing is
+        // the clock drift going uncorrected.
+        audio::play_queued() as f64 / audio::OUT_FRAME as f64 / 44.1,
     )
 }
 

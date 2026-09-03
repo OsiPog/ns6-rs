@@ -40,6 +40,8 @@ pub static PLAY_ON: AtomicBool = AtomicBool::new(false);
 pub static REC_ON: AtomicBool = AtomicBool::new(false);
 
 pub static PLAY_FRAMES: AtomicU64 = AtomicU64::new(0);
+/// Frames dropped because the host was running ahead of the device.
+pub static PLAY_DROPS: AtomicU64 = AtomicU64::new(0);
 /// Frames the device asked for that nothing had filled - audible as a gap.
 pub static PLAY_UNDERRUNS: AtomicU64 = AtomicU64::new(0);
 pub static REC_FRAMES: AtomicU64 = AtomicU64::new(0);
@@ -53,11 +55,20 @@ const REC_LIMIT: usize = 11_025 * IN_FRAME;
 
 /// Queue wire-format frames for playback, dropping the oldest if the writer is
 /// running ahead of the device.
+///
+/// Dropping happens in **whole frames**. A single byte would shift every frame
+/// boundary after it, so each 12-byte frame would then be assembled from parts
+/// of two and every 24-bit sample would come out byte-rotated: harsh distortion
+/// with the bass gone, lasting until some later drop happened to bring the
+/// offset back to a multiple of the frame size. A frame-aligned drop is a click
+/// instead, and only where the drop was.
 pub fn push_play(bytes: &[u8]) {
     if let Ok(mut q) = PLAY.lock() {
         q.extend(bytes.iter().copied());
         while q.len() > PLAY_LIMIT {
-            q.pop_front();
+            let n = OUT_FRAME.min(q.len());
+            q.drain(..n);
+            PLAY_DROPS.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -74,21 +85,22 @@ pub fn play_queued() -> usize {
 pub fn take_play(dst: &mut [u8]) {
     let mut filled = 0;
     if let Ok(mut q) = PLAY.lock() {
-        while filled < dst.len() {
-            match q.pop_front() {
-                Some(b) => {
-                    dst[filled] = b;
-                    filled += 1;
-                }
-                None => break,
-            }
+        // Whole frames only, for the same reason [`push_play`] drops whole
+        // frames: a queue that runs short should leave a clean gap, not half a
+        // frame for the next packet to build the other half of.
+        let take = dst.len().min(q.len() - q.len() % OUT_FRAME);
+        for b in q.drain(..take) {
+            dst[filled] = b;
+            filled += 1;
         }
     }
     if filled < dst.len() {
         dst[filled..].fill(0);
-        // An empty queue with nothing playing is not an underrun, it is silence.
-        // Only a gap in the middle of a stream is worth counting.
-        if filled > 0 {
+        // Every frame that had to be invented is counted, including a packet
+        // that got nothing at all. Counting only partial fills hid the worst
+        // case: a stream whose queue is empty for whole packets at a time
+        // reported nothing while stepping the waveform to zero and back.
+        if PLAY_ON.load(Ordering::Relaxed) {
             PLAY_UNDERRUNS.fetch_add(((dst.len() - filled) / OUT_FRAME) as u64, Ordering::Relaxed);
         }
     }
@@ -366,6 +378,24 @@ mod tests {
             if out[5] & 0x80 != 0 { 0xFF } else { 0 },
         ]);
         assert_eq!(r, -0x2000);
+    }
+
+    /// The queue overflows once a minute or so, because nothing here resamples
+    /// and the host's clock is not the device's. What must never happen is that
+    /// a drop shifts the frame boundary: everything after it would be built
+    /// from parts of two frames, which is heard as distortion with no bass
+    /// until a later drop happens to restore the phase.
+    #[test]
+    fn a_full_queue_drops_whole_frames() {
+        PLAY.lock().unwrap().clear();
+        // Fill past the limit by an amount that is not a whole frame.
+        let over = PLAY_LIMIT + OUT_FRAME * 3 + 5;
+        push_play(&vec![7u8; over - over % OUT_FRAME]);
+        push_play(&[7u8; OUT_FRAME]);
+
+        let left = PLAY.lock().unwrap().len();
+        assert!(left <= PLAY_LIMIT, "queue is still over its limit");
+        assert_eq!(left % OUT_FRAME, 0, "a drop broke the frame boundary");
     }
 
     #[test]
