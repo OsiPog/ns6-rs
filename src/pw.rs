@@ -114,7 +114,7 @@ fn run(alive: fn() -> bool) -> Result<(), pw::Error> {
         },
     )?;
     let _sink_listener = sink
-        .add_local_listener_with_user_data(Playback::new(prefill))
+        .add_local_listener_with_user_data(Playback::new())
         .state_changed({
             let id = sink_node.clone();
             move |stream, pb, _, new| {
@@ -127,8 +127,11 @@ fn run(alive: fn() -> bool) -> Result<(), pw::Error> {
                     audio::clear_play();
                     pb.carry.clear();
                     // The next client may deliver in quite different sized
-                    // pieces, and the queue is sized from what it sees.
+                    // pieces, and the queue is sized from what it sees - so the
+                    // depth averaged from the last one is not a measurement of
+                    // anything any more either.
                     pb.burst = 0;
+                    pb.fill = None;
                 }
             }
         })
@@ -167,16 +170,20 @@ fn run(alive: fn() -> bool) -> Result<(), pw::Error> {
         },
     )?;
     let _source_listener = source
-        .add_local_listener_with_user_data(Capture::new(refill))
+        .add_local_listener_with_user_data(Capture::new())
         .state_changed({
             let id = source_node.clone();
             move |stream, cap, _, new| {
                 id.set(stream.node_id());
                 if new != StreamState::Streaming {
                     audio::REC_ON.store(false, Ordering::Relaxed);
+                    audio::REC_PRIMED.store(false, Ordering::Relaxed);
                     // The next recorder may ask in quite different sized
-                    // pieces, and the queue is sized from what it asks for.
+                    // pieces, and the queue is sized from what it asks for - so
+                    // the depth averaged from the last one is not a measurement
+                    // of anything any more either.
                     cap.burst = 0;
+                    cap.fill = None;
                 }
             }
         })
@@ -240,6 +247,7 @@ fn run(alive: fn() -> bool) -> Result<(), pw::Error> {
 
     let quit = mainloop.clone();
     let was = Cell::new((false, false));
+    let last_pushed = Cell::new(0u64);
     let timer = mainloop.loop_().add_timer(move |_| {
         if !alive() {
             quit.quit();
@@ -262,7 +270,10 @@ fn run(alive: fn() -> bool) -> Result<(), pw::Error> {
             );
         }
         was.set((playing, listening));
-        follow(playing, listening);
+        let pushed = audio::PLAY_PUSHED.load(Ordering::Relaxed);
+        let fed = pushed != last_pushed.get();
+        last_pushed.set(pushed);
+        follow(playing, listening, fed);
     });
     let _ = timer.update_timer(Some(TICK), Some(TICK));
     mainloop.run();
@@ -277,8 +288,14 @@ fn run(alive: fn() -> bool) -> Result<(), pw::Error> {
 /// The input is what makes this worth doing: decoding it is 5.6 MB/s of
 /// bitstream for 176 kB/s of audio, most of what this driver asks of a CPU, and
 /// none of it is wanted while nobody is recording.
-fn follow(playing: bool, listening: bool) {
-    if !playing && audio::PLAY_ON.load(Ordering::Relaxed) {
+/// `fed` is whether the sink was handed anything since the last tick, and it
+/// has to be asked as well as the links: `process` primes the queue and starts
+/// the device within a few cycles of a client connecting, which is sooner than
+/// the link it connected over reaches this loop. Tearing the queue down on
+/// that gap threw away the priming and started it again - measured, 78 ms of
+/// silence written out to the device a second or two into every playback.
+fn follow(playing: bool, listening: bool, fed: bool) {
+    if !playing && !fed && audio::PLAY_ON.load(Ordering::Relaxed) {
         audio::PLAY_ON.store(false, Ordering::Relaxed);
         audio::clear_play();
     }
@@ -288,7 +305,7 @@ fn follow(playing: bool, listening: bool) {
             // in the data, so a new listener starts on a freshly aligned stream
             // rather than on whatever the last one left behind.
             iso::reset_rec_align();
-            let _ = audio::drain_rec();
+            audio::arm_rec();
         }
         audio::REC_ON.store(listening, Ordering::Relaxed);
     }
@@ -303,8 +320,9 @@ struct Playback {
     /// Where to ask the resampler for a slightly different rate, once the
     /// adapter has given us the area to ask in. Null until then.
     rate_match: *mut spa::sys::spa_io_rate_match,
-    /// Queue depth, smoothed. See [`FILL_ALPHA`].
-    fill: f64,
+    /// Queue depth, smoothed. See [`SMOOTH_SECONDS`]. `None` until the first
+    /// cycle has a depth to seed it with.
+    fill: Option<f64>,
     /// The largest buffer this client has handed over recently, in bytes of
     /// wire frames. See [`Playback::target`].
     burst: usize,
@@ -316,12 +334,12 @@ struct Playback {
 }
 
 impl Playback {
-    fn new(target: usize) -> Self {
+    fn new() -> Self {
         Self {
             carry: Vec::with_capacity(16 * 1024),
             wire: Vec::with_capacity(24 * 1024),
             rate_match: std::ptr::null_mut(),
-            fill: target as f64,
+            fill: None,
             burst: 0,
             correction: 1.0,
             matching: std::env::var("NS6_NO_RATE_MATCH").is_err(),
@@ -347,12 +365,32 @@ impl Playback {
     }
 }
 
-/// How hard to pull the queue back towards its target depth.
+/// How hard to pull the queue back towards its target depth: the fractional
+/// rate correction asked for per second the queue is away from where it should
+/// be.
 ///
 /// The queue is an integrator - a rate error accumulates in it - so a plain
-/// proportional term is enough and settles at a small standing offset instead
-/// of hunting. The drift being corrected here measures around 0.4%, so a
-/// standing offset of a few percent of the target is nothing.
+/// proportional term is enough, and settles at a standing offset rather than
+/// hunting. A drift of 100 ppm parks the queue 2 ms off target here, which is
+/// nothing.
+///
+/// This and [`SMOOTH_SECONDS`] are the whole loop, and it is the two of them
+/// together that decide whether it settles or rings: a depth measured through
+/// a lag of `t` seconds and corrected with a gain of `k` per second is a
+/// second-order loop damped by `1 / (2 * sqrt(k * t))`. At 0.05 against 5 s
+/// that is exactly 1 - critically damped, so a queue knocked off target comes
+/// back to it without overshooting past.
+///
+/// **This is the distortion that arrives partway through a long tone.** The
+/// gain here used to be twenty times this against the same lag, which is a
+/// damping of 0.22: a loop that rings rather than settles. It did. Measured
+/// through the graph on a 200 Hz tone, both queues swung across their whole
+/// 0-250 ms range on a 45-second cycle and hit each end of it - empty, where
+/// the frames nobody had are written out as silence, and the 250 ms cap, where
+/// the frames nobody took are dropped. Either is a step in the waveform, and a
+/// step in a steady tone is a click. Nothing else in the run was wrong: the
+/// bitstream the device sent was bit-exact and continuously aligned across the
+/// whole of it, and the frames handed to the device were the tone.
 const RATE_GAIN: f64 = 0.05;
 
 /// The most correction that will ever be asked for, either way.
@@ -361,7 +399,7 @@ const RATE_GAIN: f64 = 0.05;
 /// else, and a runaway controller must not be able to hide it.
 const RATE_LIMIT: f64 = 0.01;
 
-/// How much of the measured depth to believe each cycle.
+/// How long the queue depth is averaged over.
 ///
 /// The raw depth is useless to steer on: it drops by a whole quantum as the
 /// device drains it and jumps back up when the next buffer arrives, so it
@@ -369,37 +407,85 @@ const RATE_LIMIT: f64 = 0.01;
 /// resampling ratio at graph rate, which is heard as dirt on the audio - most
 /// obviously on a low tone, where the modulation is a large part of a period.
 /// Drift, in contrast, is a thing that changes over minutes.
-const FILL_ALPHA: f64 = 0.005;
+///
+/// In seconds and not in cycles, because a cycle is whatever quantum the
+/// client chose. The same per-cycle number is a 1-second lag for one client
+/// and a 20-second one for another, and only one of those is a loop that
+/// settles - see [`RATE_GAIN`], which is tuned against this.
+const SMOOTH_SECONDS: f64 = 5.0;
 
-/// The most the correction may move in one cycle.
+/// The most the correction may move in a second.
 ///
 /// A resampling ratio that steps is a click. There is no hurry: nothing being
-/// corrected here changes faster than a crystal warms up.
-const RATE_SLEW: f64 = 0.000_05;
+/// corrected here changes faster than a crystal warms up, and 0.002 still
+/// crosses the whole of [`RATE_LIMIT`] in five seconds.
+const RATE_SLEW: f64 = 0.002;
 
-/// Ask the resampler to run a little slow or a little fast, to hold the
-/// device's queue at the depth it was primed to.
+/// One step of the loop that holds a queue at the depth it was primed to.
+///
+/// Both directions run this same loop against the same constants, because it
+/// is the same loop: a queue between two clocks, and a resampler that can be
+/// asked to run a little slow or a little fast to keep it where it was put.
+/// Which side of the queue this driver is on only changes what `queued` counts.
+///
+/// `cycle` - the frames this cycle carried - is the clock. The constants are
+/// in seconds, and reading the time from the cycle count instead would tie the
+/// tuning to the client's quantum, which is the client's to choose.
+fn hold_queue(
+    area: *mut spa::sys::spa_io_rate_match,
+    fill: &mut Option<f64>,
+    correction: &mut f64,
+    queued: usize,
+    target: usize,
+    frame: usize,
+    cycle: usize,
+) {
+    if area.is_null() || target == 0 {
+        return;
+    }
+    let depth = (queued / frame) as f64;
+    // The first cycle has nothing to average with, so the depth it finds is
+    // the average. Starting from a guess instead is starting by correcting an
+    // error that is not there: the queue is primed to its target before any of
+    // this runs, and a loop told it was 87 ms short of that spends the first
+    // half-minute pulling against nothing.
+    let fill = fill.get_or_insert(depth);
+    if cycle > 0 {
+        let dt = cycle as f64 / RATE as f64;
+        *fill += (depth - *fill) * (dt / SMOOTH_SECONDS).min(1.0);
+        // Seconds of audio away from where the queue should be.
+        let error = (*fill - (target / frame) as f64) / RATE as f64;
+        // Too full means the resampler is handing this side frames faster than
+        // the far end is taking them, so it should hand over slightly fewer.
+        let want = (1.0 - RATE_GAIN * error).clamp(1.0 - RATE_LIMIT, 1.0 + RATE_LIMIT);
+        let slew = RATE_SLEW * dt;
+        *correction += (want - *correction).clamp(-slew, slew);
+    }
+    unsafe {
+        (*area).rate = *correction;
+        (*area).flags |= spa::sys::SPA_IO_RATE_MATCH_FLAG_ACTIVE;
+    }
+}
+
+/// Hold the queue the device is draining at the depth it was primed to.
 ///
 /// This is the whole answer to the clock problem. The device's crystal and the
 /// graph's are independent, nothing else here resamples, and without this the
 /// queue walks steadily to one end: to the 250 ms cap, where frames are dropped
 /// once a minute, or to empty, where they are made up as silence.
-fn follow_the_device_clock(pb: &mut Playback, target: usize) {
-    if pb.rate_match.is_null() || !pb.matching || target == 0 {
+fn follow_the_device_clock(pb: &mut Playback, target: usize, cycle: usize) {
+    if !pb.matching {
         return;
     }
-    let fill = audio::play_queued() as f64;
-    pb.fill += (fill - pb.fill) * FILL_ALPHA;
-
-    let error = (pb.fill - target as f64) / target as f64;
-    // Too full means the resampler is handing us frames faster than the device
-    // is taking them, so it should hand us slightly fewer.
-    let want = (1.0 - RATE_GAIN * error).clamp(1.0 - RATE_LIMIT, 1.0 + RATE_LIMIT);
-    pb.correction += (want - pb.correction).clamp(-RATE_SLEW, RATE_SLEW);
-    unsafe {
-        (*pb.rate_match).rate = pb.correction;
-        (*pb.rate_match).flags |= spa::sys::SPA_IO_RATE_MATCH_FLAG_ACTIVE;
-    }
+    hold_queue(
+        pb.rate_match,
+        &mut pb.fill,
+        &mut pb.correction,
+        audio::play_queued(),
+        target,
+        audio::OUT_FRAME,
+        cycle,
+    );
 }
 
 /// Take one buffer from the graph and queue it for the device.
@@ -426,6 +512,7 @@ fn play(stream: &Stream, pb: &mut Playback, gain: f32, prefill: usize) {
     let used = audio::encode_host_quad(&pb.carry, gain, &mut pb.wire);
     pb.carry.drain(..used);
     pb.burst = pb.burst.max(pb.wire.len());
+    let cycle = pb.wire.len() / audio::OUT_FRAME;
     audio::push_play(&pb.wire);
 
     let target = pb.target(prefill);
@@ -434,7 +521,7 @@ fn play(stream: &Stream, pb: &mut Playback, gain: f32, prefill: usize) {
     if !audio::PLAY_ON.load(Ordering::Relaxed) && audio::play_queued() >= target {
         audio::PLAY_ON.store(true, Ordering::Relaxed);
     } else {
-        follow_the_device_clock(pb, target);
+        follow_the_device_clock(pb, target, cycle);
     }
 }
 
@@ -448,8 +535,9 @@ struct Capture {
     /// Whether it was ever offered at all. A client speaking the device's own
     /// rate may be given no resampler, and then there is nothing to ask.
     offered: bool,
-    /// Queue depth, smoothed. See [`FILL_ALPHA`].
-    fill: f64,
+    /// Queue depth, smoothed. See [`SMOOTH_SECONDS`]. `None` until the first
+    /// cycle has a depth to seed it with.
+    fill: Option<f64>,
     /// The largest buffer this client has asked for, in bytes of decoded
     /// frames. See [`Capture::target`].
     burst: usize,
@@ -459,12 +547,12 @@ struct Capture {
 }
 
 impl Capture {
-    fn new(target: usize) -> Self {
+    fn new() -> Self {
         Self {
             host: Vec::with_capacity(16 * 1024),
             rate_match: std::ptr::null_mut(),
             offered: false,
-            fill: target as f64,
+            fill: None,
             burst: 0,
             correction: 1.0,
             matching: std::env::var("NS6_NO_RATE_MATCH").is_err(),
@@ -499,25 +587,21 @@ impl Capture {
 /// written out as silence at 442 frames a second. A runaway in a loop this
 /// slow looks like a steady fault, so it is worth being able to see the
 /// number: the `capture loop:` line reports the correction being asked for.
-fn follow_the_device_clock_in(cap: &mut Capture, target: usize) {
-    if cap.rate_match.is_null() || !cap.matching || target == 0 {
+fn follow_the_device_clock_in(cap: &mut Capture, target: usize, cycle: usize) {
+    if !cap.matching {
         return;
     }
-    let fill = audio::rec_queued() as f64;
-    cap.fill += (fill - cap.fill) * FILL_ALPHA;
-
-    let error = (cap.fill - target as f64) / target as f64;
-    // Too full means the device is producing faster than the graph is taking,
-    // so the graph should take slightly more - which is what a rate below 1
-    // asks for.
-    let want = (1.0 - RATE_GAIN * error).clamp(1.0 - RATE_LIMIT, 1.0 + RATE_LIMIT);
-    cap.correction += (want - cap.correction).clamp(-RATE_SLEW, RATE_SLEW);
+    hold_queue(
+        cap.rate_match,
+        &mut cap.fill,
+        &mut cap.correction,
+        audio::rec_queued(),
+        target,
+        audio::IN_FRAME,
+        cycle,
+    );
     REC_CORRECTION.store(((cap.correction - 1.0) * 1e6) as i64, Ordering::Relaxed);
     REC_TARGET.store(target as i64, Ordering::Relaxed);
-    unsafe {
-        (*cap.rate_match).rate = cap.correction;
-        (*cap.rate_match).flags |= spa::sys::SPA_IO_RATE_MATCH_FLAG_ACTIVE;
-    }
 }
 
 /// Whether the source was ever offered a rate-match area, for reporting.
@@ -550,16 +634,32 @@ fn capture(stream: &Stream, cap: &mut Capture, refill: usize) {
         requested.min(capacity)
     };
 
-    cap.host.clear();
-    audio::to_host(&audio::take_rec(frames * audio::IN_FRAME), &mut cap.host);
-    let have = cap.host.len();
-    slice[..have].copy_from_slice(&cap.host);
+    cap.burst = cap.burst.max(frames * audio::IN_FRAME);
+    let target = cap.target(refill);
+    let want = frames * audio::HOST_FRAME;
+
+    // The lead-in, once per listener: hold the graph on silence rather than on
+    // fragments until there is a queue to serve it from. See [`REC_PRIMED`].
+    let primed = audio::REC_PRIMED.load(Ordering::Relaxed) || {
+        let full = audio::rec_queued() >= target;
+        audio::REC_PRIMED.store(full, Ordering::Relaxed);
+        full
+    };
+
+    let have = if primed {
+        cap.host.clear();
+        audio::to_host(&audio::take_rec(frames * audio::IN_FRAME), &mut cap.host);
+        slice[..cap.host.len()].copy_from_slice(&cap.host);
+        cap.host.len()
+    } else {
+        0
+    };
     // Short of what was asked for: the device has not sent it yet, and silence
     // is the only honest thing to put in its place - but it is still a gap,
-    // and a gap nobody counts is one nobody can be shown.
-    let want = frames * audio::HOST_FRAME;
+    // and a gap nobody counts is one nobody can be shown. The lead-in is not
+    // one of those: nothing is missing there, the queue is being filled.
     slice[have..want].fill(0);
-    if have < want && audio::REC_ON.load(Ordering::Relaxed) {
+    if primed && have < want && audio::REC_ON.load(Ordering::Relaxed) {
         let short = ((want - have) / audio::HOST_FRAME) as u64;
         audio::REC_UNDERRUNS.fetch_add(short, Ordering::Relaxed);
     }
@@ -567,11 +667,12 @@ fn capture(stream: &Stream, cap: &mut Capture, refill: usize) {
     let chunk = data.chunk_mut();
     *chunk.offset_mut() = 0;
     *chunk.stride_mut() = audio::HOST_FRAME as i32;
-    *chunk.size_mut() = (frames * audio::HOST_FRAME) as u32;
+    *chunk.size_mut() = want as u32;
 
-    cap.burst = cap.burst.max(frames * audio::IN_FRAME);
     REC_MATCHING.store(cap.offered, Ordering::Relaxed);
-    follow_the_device_clock_in(cap, cap.target(refill));
+    if primed {
+        follow_the_device_clock_in(cap, target, frames);
+    }
 }
 
 /// What each node carries: four channels out, two in.

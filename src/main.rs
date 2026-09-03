@@ -2277,13 +2277,16 @@ fn audio_status() -> String {
         *last = Some((now, out, inn));
     }
     format!(
-        "audio: {out} frames out ({} underruns, {} dropped), {inn} frames in ({} dropped, {} short){rates}  queue {:.0} ms out / {:.0} ms in",
+        "audio: {out} frames out ({} underruns, {} dropped), {inn} frames in ({} dropped, {} short, {} relocks){rates}  queue {:.0} ms out / {:.0} ms in",
         audio::PLAY_UNDERRUNS.load(Ordering::Relaxed),
         // Drops mean the host is running ahead of the device's own clock, so
         // this counter is the drift made visible: nothing here resamples.
         audio::PLAY_DROPS.load(Ordering::Relaxed),
         audio::REC_OVERRUNS.load(Ordering::Relaxed),
         audio::REC_UNDERRUNS.load(Ordering::Relaxed),
+        // Bytes lost between the device and the decoder. Should be zero; a
+        // number here is the input's phase having had to be found again.
+        audio::REC_RELOCKS.load(Ordering::Relaxed),
         // Where the rate matching has settled. It should sit near NS6_PLAY_MS
         // and stay there; a queue walking towards 250 ms or towards nothing is
         // the clock drift going uncorrected.

@@ -38,8 +38,24 @@ pub static REC: Mutex<VecDeque<u8>> = Mutex::new(VecDeque::new());
 pub static PLAY_ON: AtomicBool = AtomicBool::new(false);
 /// Decode bulk IN 0x86 into [`REC`].
 pub static REC_ON: AtomicBool = AtomicBool::new(false);
+/// Whether [`REC`] has been filled to its target since it was last armed.
+///
+/// The capture queue starts empty and the graph starts asking immediately, so
+/// the front of every recording is served from a queue that has not got it
+/// yet. Answering with whatever has arrived and zeroes for the rest chops that
+/// front into fragments with a step at each join; waiting until the queue has
+/// its target in it makes the same wait one clean run of silence, and
+/// everything after it whole.
+pub static REC_PRIMED: AtomicBool = AtomicBool::new(false);
 
 pub static PLAY_FRAMES: AtomicU64 = AtomicU64::new(0);
+/// Frames the graph has handed over for playback, cumulative.
+///
+/// Not the same question as [`PLAY_FRAMES`], which counts what the device took.
+/// This one is only ever asked as "has it moved since last time", because a
+/// sink still being handed audio is a sink in use whatever else has been
+/// noticed yet - see the graph's own answer in `pw::follow`.
+pub static PLAY_PUSHED: AtomicU64 = AtomicU64::new(0);
 /// Frames dropped because the host was running ahead of the device.
 pub static PLAY_DROPS: AtomicU64 = AtomicU64::new(0);
 /// Frames the device asked for that nothing had filled - audible as a gap.
@@ -54,6 +70,15 @@ pub static REC_OVERRUNS: AtomicU64 = AtomicU64::new(0);
 /// counts is a gap nothing can be shown, and the capture path's whole failure
 /// mode is quiet.
 pub static REC_UNDERRUNS: AtomicU64 = AtomicU64::new(0);
+/// Times the decoder has had to find the bit phase again mid-stream.
+///
+/// Should be zero. Anything else is bytes lost between the device and here,
+/// and the number matters because of what it used to cost: the phase was found
+/// once and then trusted for as long as the driver ran, so the first loss took
+/// the input away for good - either silently, or as noise 57 dB down that
+/// nothing in the driver would report. It is worth one comparison a frame to
+/// find that out instead of assuming it cannot happen.
+pub static REC_RELOCKS: AtomicU64 = AtomicU64::new(0);
 
 /// About 250 ms of slack in each direction. Enough to ride out a scheduling
 /// hiccup, small enough that latency stays usable.
@@ -70,6 +95,7 @@ const REC_LIMIT: usize = 11_025 * IN_FRAME;
 /// offset back to a multiple of the frame size. A frame-aligned drop is a click
 /// instead, and only where the drop was.
 pub fn push_play(bytes: &[u8]) {
+    PLAY_PUSHED.fetch_add((bytes.len() / OUT_FRAME) as u64, Ordering::Relaxed);
     if let Ok(mut q) = PLAY.lock() {
         q.extend(bytes.iter().copied());
         while q.len() > PLAY_LIMIT {
@@ -174,6 +200,25 @@ pub fn encode_frame(left: i32, right: i32, to: Out, out: &mut [u8; OUT_FRAME]) {
     }
 }
 
+/// Whether one 64-unit frame's two pad windows are still zero.
+///
+/// Positions 24..32 and 56..64 of a frame are the 8 bits each 32-bit I2S slot
+/// carries after its 24 data bits, and the device sends them as zeros. That
+/// makes them both the way in - a phase can be found by looking for them - and
+/// the way to tell that a phase already found has stopped being true.
+fn pads_are_clear(frame: &[u8]) -> bool {
+    frame[SLOT_BITS..32].iter().all(|&b| b == 0)
+        && frame[32 + SLOT_BITS..IN_UNITS_PER_FRAME].iter().all(|&b| b == 0)
+}
+
+/// Whether a payload carries any set bit when read from `offset` in twos.
+///
+/// The bits are in the even bytes of the *stream*, and the odd ones are always
+/// zero, so this answers "is this the parity the data is on".
+fn reads_as_data(payload: &[u8], offset: usize) -> bool {
+    payload.len() > offset && payload[offset..].iter().step_by(2).any(|b| b & 1 != 0)
+}
+
 /// Find the bit phase at which the I2S pad bits line up.
 ///
 /// Positions 24..32 and 56..64 of every 64-unit frame are always zero, which is
@@ -195,10 +240,8 @@ pub fn find_alignment(units: &[u8]) -> Option<usize> {
     'phase: for phase in 0..IN_UNITS_PER_FRAME {
         for f in 0..frames - 1 {
             let base = phase + f * IN_UNITS_PER_FRAME;
-            for i in SLOT_BITS..32 {
-                if units[base + i] != 0 || units[base + 32 + i] != 0 {
-                    continue 'phase;
-                }
+            if !pads_are_clear(&units[base..base + IN_UNITS_PER_FRAME]) {
+                continue 'phase;
             }
         }
         return Some(phase);
@@ -278,6 +321,20 @@ pub fn decode_i2s(payload: &[u8], st: &mut Rec, out: &mut Vec<u8>) {
     // One bit per two-byte unit, in the even bytes of the *stream* - see
     // [`Rec::start`] for why that is not the same as the even bytes of this
     // payload.
+    // Nothing on the parity being read and something on the other one is not
+    // silence: it is this side reading the bytes that never carry anything.
+    // Losing an odd number of bytes - a transfer that failed, and they do fail
+    // - is what puts it there, and it has to be caught here rather than below,
+    // because a payload read off the empty bytes decodes to zeros and zeros
+    // pass every test the phase has. Real silence is silent on both parities,
+    // so this cannot fire on it.
+    if !reads_as_data(payload, st.start) && reads_as_data(payload, 1 - st.start) {
+        let other = 1 - st.start;
+        st.reset();
+        st.start = other;
+        REC_RELOCKS.fetch_add(1, Ordering::Relaxed);
+    }
+
     let mut i = st.start;
     while i < payload.len() {
         st.units.push(payload[i] & 1);
@@ -317,15 +374,40 @@ pub fn decode_i2s(payload: &[u8], st: &mut Rec, out: &mut Vec<u8>) {
         }
     }
 
-    let frames = st.units.len() / IN_UNITS_PER_FRAME;
-    for f in 0..frames {
-        let base = f * IN_UNITS_PER_FRAME;
+    // The phase is checked against every frame, not assumed to hold because it
+    // held once. It is held by counting bytes, and a payload that never
+    // arrived is bytes that were never counted: the frames after it are then
+    // cut somewhere in the middle of a sample, and 24 bits read across that cut
+    // are not the sample and not anything. Nothing further on can tell - the
+    // stream carries no timestamps and no framing of its own - so the pad bits
+    // are the whole of the evidence, and finding them gone is the moment to
+    // stop trusting the phase rather than to keep decoding through it.
+    //
+    // Re-locking recovers the audio but cannot always recover which channel is
+    // which. The two 32-bit slots in a frame are identical in shape, so a phase
+    // and that phase plus half a frame both fit the pad bits equally, and the
+    // word clock that would say which is which is not on this wire. A loss that
+    // lands on the wrong one of the two swaps left and right for the rest of
+    // the run. That is worth saying and not worth avoiding by doing nothing:
+    // the loss used to end the input altogether. In practice it rarely arises -
+    // a whole lost transfer is 131072 bytes, which is a whole number of frames,
+    // so the phase survives it and only the gap is heard.
+    let mut done = 0;
+    while st.units.len() - done >= IN_UNITS_PER_FRAME {
+        if !pads_are_clear(&st.units[done..done + IN_UNITS_PER_FRAME]) {
+            st.locked = false;
+            REC_RELOCKS.fetch_add(1, Ordering::Relaxed);
+            break;
+        }
         for slot in [0usize, 32] {
-            let v = word(&st.units[base + slot..base + slot + SLOT_BITS]);
+            let v = word(&st.units[done + slot..done + slot + SLOT_BITS]);
             out.extend_from_slice(&v.to_le_bytes()[..3]);
         }
+        done += IN_UNITS_PER_FRAME;
     }
-    st.units.drain(..frames * IN_UNITS_PER_FRAME);
+    // Whatever is left is either the front of the next frame or the wreckage
+    // the next payload will re-lock across; either way it stays.
+    st.units.drain(..done);
 }
 
 /// Hand decoded frames to whoever is recording.
@@ -368,6 +450,12 @@ pub fn clear_play() {
     if let Ok(mut q) = PLAY.lock() {
         q.clear();
     }
+}
+
+/// Arm the capture side for a new listener: nothing kept, nothing primed.
+pub fn arm_rec() {
+    REC_PRIMED.store(false, Ordering::Relaxed);
+    let _ = drain_rec();
 }
 
 /// Bytes per host-side frame: 32-bit little-endian stereo.
@@ -609,6 +697,88 @@ mod tests {
         decode_i2s(&payload, &mut st, &mut out);
         assert!(st.locked, "audio after silence has to lock");
         assert_eq!(&out[..3], &[0x56, 0x34, 0x12]);
+    }
+
+    /// The wire bytes for a run of frames, each one distinguishable from the
+    /// next so a decoder that has slipped cannot pass for one that has not.
+    fn wire(frames: std::ops::Range<i32>) -> Vec<u8> {
+        let mut w = Vec::new();
+        for i in frames {
+            for u in units_for(0x0F_0000 + i * 3, -0x0E_0000 + i * 5) {
+                w.push(u);
+                w.push(0);
+            }
+        }
+        w
+    }
+
+    /// The phase is held by counting bytes, so bytes that never arrive move it.
+    /// It used to be found once and trusted for the rest of the run: the first
+    /// lost transfer therefore cut every frame after it somewhere in the middle
+    /// of a sample, and the input never came back. Measured through the graph,
+    /// that is a 200 Hz tone replaced by noise 57 dB down, for good.
+    #[test]
+    fn a_lost_transfer_does_not_take_the_input_with_it() {
+        let stream = wire(0..400);
+        let frame = IN_UNITS_PER_FRAME * 2;
+
+        // Lose an even number of bytes that is not a whole frame, in the middle.
+        let mut cut = Vec::new();
+        cut.extend_from_slice(&stream[..100 * frame]);
+        cut.extend_from_slice(&stream[100 * frame + 30..]);
+
+        let mut st = Rec::default();
+        let mut out = Vec::new();
+        // One payload at a time, as the bulk pipe delivers them.
+        for chunk in cut.chunks(64 * frame) {
+            decode_i2s(chunk, &mut st, &mut out);
+        }
+        assert!(st.locked, "the decoder has to find the phase again");
+        assert!(REC_RELOCKS.load(Ordering::Relaxed) > 0, "and say so");
+
+        // The tail of the stream has to come out as the tail of the stream,
+        // whatever was lost in the middle.
+        assert_tail_recovered(&out, &stream[300 * frame..]);
+    }
+
+    /// The decoded tail has to be the stream's own tail - allowing for the two
+    /// channels having come back the other way round, which a re-lock cannot
+    /// always avoid. See the note in [`decode_i2s`].
+    fn assert_tail_recovered(out: &[u8], stream_tail: &[u8]) {
+        let mut want = Vec::new();
+        decode_i2s(stream_tail, &mut Rec::default(), &mut want);
+        let got = &out[out.len() - want.len()..];
+        let slot = IN_FRAME / 2;
+        let n = want.len() - slot;
+        assert!(
+            got == want || got[slot..] == want[..n] || got[..n] == want[slot..],
+            "the audio after the loss is not the audio, on either slot"
+        );
+    }
+
+    /// And the odd-length case, which is the one that goes quiet: the bits are
+    /// in the even bytes of the stream, so losing an odd number of them leaves
+    /// every payload after it read from the odd bytes, which are always zero.
+    #[test]
+    fn losing_an_odd_number_of_bytes_finds_the_parity_again() {
+        let stream = wire(0..400);
+        let frame = IN_UNITS_PER_FRAME * 2;
+
+        let mut cut = Vec::new();
+        cut.extend_from_slice(&stream[..100 * frame]);
+        cut.extend_from_slice(&stream[100 * frame + 31..]);
+
+        let mut st = Rec::default();
+        let mut out = Vec::new();
+        for chunk in cut.chunks(64 * frame) {
+            decode_i2s(chunk, &mut st, &mut out);
+        }
+        assert!(st.locked, "the decoder has to find the parity and the phase");
+        assert!(
+            out.iter().rev().take(1024).any(|&b| b != 0),
+            "the input stayed on the empty parity"
+        );
+        assert_tail_recovered(&out, &stream[300 * frame..]);
     }
 
     /// A new listener starts on a freshly aligned stream, not on whatever the

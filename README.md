@@ -362,19 +362,89 @@ then sits at its target instead of climbing.
 A client already speaking the device's rate may be handed no resampler at all, and
 then there is nothing to ask; the driver says which case it is rather than assuming.
 
+#### And the loop that asks has to settle
+
+Answering the device's clock is half of it. Something still has to hold each
+queue at a constant depth, and that something is a control loop with a shape
+that can be got wrong. It was. The depth was averaged over about five seconds
+and then corrected with a gain of 0.05 *per cycle*, which against a queue - an
+integrator - is a second-order loop damped by about 0.22. That is a loop that
+rings rather than settles.
+
+It rang. Played into the sink and recorded back off the source, 200 Hz for 150
+seconds: both queues swept their whole 0-250 ms range on a cycle of about 45
+seconds and hit each end of it. Empty is written out as silence; the 250 ms cap
+drops frames. Either is a step in the waveform, and that run came back with
+eleven of them - 1910 frames dropped on the way out, 1301 on the way in, and
+the correction pinned at its 1% clamp for most of the run. None of it was the
+device: the bitstream it sent decoded bit-exact and stayed aligned across the
+whole run, and the wire frames handed to it were the tone, so both ends were
+right and the middle was not.
+
+The gain is now 0.05 per *second* of depth error against the same five-second
+average, which is a damping of exactly 1, and the loop reads its clock off the
+frames each cycle carries rather than off the cycles themselves - so a client
+choosing a different quantum no longer changes the tuning. Measured the same
+way, 300 seconds of the same tone:
+
+| | before | after |
+|---|---|---|
+| Playback queue | 12-241 ms | 85-127 ms |
+| Capture queue | 23-238 ms | 111-180 ms |
+| Frames dropped, out / in | 1910 / 1301 | 0 / 0 |
+| Correction asked for | pinned at +-10000 ppm | -3 ppm |
+| Discontinuities in the recording | 11, spread through the run | 2, both inside the first 9 seconds |
+
+#### A phase found once is not a phase found
+
+The input's bit phase is held by counting bytes, so bytes that never arrive
+move it - and it used to be found once and then trusted for as long as the
+driver ran. The first lost transfer therefore cut every frame after it
+somewhere in the middle of a sample, for good: 24 bits read across that cut are
+not the sample and not anything. Nothing downstream can tell, because the
+stream carries no timestamps and no framing of its own.
+
+The pad bits are the evidence, and they are now checked against every frame
+rather than only while hunting: 24..32 and 56..64 of a frame are the bits each
+32-bit I2S slot carries after its 24 data bits, and the device sends them as
+zeros. Finding them gone is the moment to stop trusting the phase and find it
+again. Losing an *odd* number of bytes is the worse half of the same fault -
+the bits are in the even bytes of the stream, so every payload after it is read
+off the odd ones, which carry nothing, and the input goes quiet and stays quiet.
+That is caught separately, because zeros pass the pad test: a payload with
+nothing on the parity being read and something on the other one is not silence.
+Real silence is silent on both.
+
+Re-locking recovers the audio but not always which channel is which. The two
+slots in a frame are identical in shape, so a phase and that phase plus half a
+frame fit the pad bits equally well, and the word clock that would separate them
+is not on this wire. A loss landing on the wrong one of the two swaps left and
+right for the rest of the run. In practice it rarely arises - a whole lost
+transfer is 131072 bytes, which is a whole number of frames, so the phase
+survives it and only the gap is heard - and it is worth saying rather than
+avoiding by doing nothing, which is what losing the input altogether was.
+
+The count is in the status line as `relocks`, and it should be zero.
+
 The driver reports all of it, because the only way to see any of this is from both
 sides at once:
 
 ```
-clock: device asks 44101.10 Hz over 125018 ms, sending 44099.73 Hz; sent - asked = 641 frames; capture rate-match offered
-capture loop: target 20 ms, asking -16 ppm
+audio: 13215739 frames out (250 underruns, 0 dropped), 13213760 frames in (0 dropped, 300 short, 0 relocks)  [44086 Hz out, 44017 Hz in]  queue 108 ms out / 139 ms in
+clock: device asks 44100.78 Hz over 300063 ms, sending 44101.59 Hz; sent - asked = 604 frames
+capture: rate-match offered, target 128 ms, asking -3 ppm
 ```
 
-That last number staying put is the whole of it. `NS6_NO_FEEDBACK=1` sends the
-nominal rate instead, which is what this driver did before the pipe was read, and
-is how the two are compared in one run on the same binary.
+The correction staying near nothing and the queues staying where they were put
+is the whole of it. `NS6_NO_FEEDBACK=1` sends the nominal rate instead, which is
+what this driver did before the pipe was read, and is how the two are compared
+in one run on the same binary.
 
-Underruns stay at a few milliseconds, all of them at start-up.
+Underruns stay at a few milliseconds, all of them at start-up: 250 frames out
+and 300 in over five minutes, none of them after the first few seconds. The
+front of a recording is a clean run of silence rather than fragments, because
+the capture queue is filled to its target before any of it is handed over -
+the same priming the playback side has always done, from the other side.
 
 ### After a power cycle, wait
 
